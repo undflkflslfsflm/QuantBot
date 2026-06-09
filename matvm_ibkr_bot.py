@@ -47,6 +47,7 @@ DECISION_MATERIAL_DD_REDUCTION = 0.08
 VOL_TARGET_BENCHMARKS = (0.08, 0.10, 0.12)
 VOL_TARGET_LOOKBACK_DAYS = 63
 EXPOSURE_MATCHED_PREFIXES = ("StaticMatched_", "SameCashSchedule_")
+DEFAULT_RANDOM_NULL_SEEDS = 100
 WALK_FORWARD_CANDIDATE_VARIANTS = (
     "baseline",
     "CashTiming_ThresholdSweep_Loose",
@@ -1276,6 +1277,24 @@ def _classify_strategy(summary: Dict[str, object]) -> Tuple[str, List[str]]:
     base_vs_random_median = _metric_value(
         summary.get("BaseVsRandomMedian_Sharpe_Excess_Delta")
     )
+    base_random_percentile_sharpe = _metric_value(
+        summary.get("BaseRandomPercentile_Sharpe_Excess")
+    )
+    selected_random_percentile_sharpe = _metric_value(
+        summary.get("SelectedCandidateRandomPercentile_Sharpe_Excess")
+    )
+    random_beat_base_rate_sharpe = _metric_value(
+        summary.get("RandomBeatBaseRate_Sharpe_Excess")
+    )
+    selected_static_sharpe_delta = _metric_value(
+        summary.get("SelectedCandidate_Sharpe_Delta_vs_StaticMatched_EqualWeightRisk_Cash")
+    )
+    selected_same_cash_sharpe_delta = _metric_value(
+        summary.get("SelectedCandidate_Sharpe_Delta_vs_SameCashSchedule_EqualWeightRisk")
+    )
+    selected_dd_reduction = _metric_value(
+        summary.get("SelectedCandidate_Drawdown_Reduction_vs_EqualWeightRisk")
+    )
     candidate_mean_active_sharpe = _metric_value(
         summary.get("WalkForwardCandidateMeanActiveSharpe")
     )
@@ -1349,6 +1368,31 @@ def _classify_strategy(summary: Dict[str, object]) -> Tuple[str, List[str]]:
             reasons.append("MATVM base selection beats median random same-cash selection on excess Sharpe")
         else:
             reasons.append("MATVM base selection loses to median random same-cash selection on excess Sharpe")
+    reasons.append("Random variants are diagnostic-only and excluded from candidate selection")
+    if random_beat_base_rate_sharpe is not None:
+        reasons.append(
+            "Random null model beats base on Sharpe_Excess in "
+            f"{random_beat_base_rate_sharpe:.1%} of runs"
+        )
+    if base_random_percentile_sharpe is not None:
+        reasons.append(
+            "Base Sharpe_Excess percentile versus random null is "
+            f"{base_random_percentile_sharpe:.1%}"
+        )
+        if base_random_percentile_sharpe < 0.50:
+            reasons.append("Asset-selection edge is not proven: base fails the random-null test")
+        elif base_random_percentile_sharpe < 0.75:
+            reasons.append("Asset-selection edge is not proven: base random-null percentile is below 75%")
+    if selected_static_sharpe_delta is not None:
+        if selected_static_sharpe_delta >= 0:
+            reasons.append("Selected non-diagnostic candidate beats StaticMatched EqualWeightRisk/Cash on excess Sharpe")
+        else:
+            reasons.append("Selected non-diagnostic candidate loses to StaticMatched EqualWeightRisk/Cash on excess Sharpe")
+    if selected_same_cash_sharpe_delta is not None:
+        if selected_same_cash_sharpe_delta >= 0:
+            reasons.append("Selected non-diagnostic candidate beats SameCashSchedule EqualWeightRisk on excess Sharpe")
+        else:
+            reasons.append("Selected non-diagnostic candidate loses to SameCashSchedule EqualWeightRisk on excess Sharpe")
     if candidate_mean_active_sharpe is not None:
         if candidate_mean_active_sharpe > 1e-6:
             reasons.append("Walk-forward candidate selection improves base on average test excess Sharpe")
@@ -1360,16 +1404,25 @@ def _classify_strategy(summary: Dict[str, object]) -> Tuple[str, List[str]]:
     if (
         strategy_sharpe is not None
         and strategy_sharpe >= DECISION_MIN_EXCESS_SHARPE
-        and ew_dd_reduction is not None
-        and ew_dd_reduction >= DECISION_MATERIAL_DD_REDUCTION
-        and exposure_sharpe_delta is not None
-        and exposure_sharpe_delta >= 0
-        and same_cash_sharpe_delta is not None
-        and same_cash_sharpe_delta >= 0
+        and selected_dd_reduction is not None
+        and selected_dd_reduction >= DECISION_MATERIAL_DD_REDUCTION
+        and selected_static_sharpe_delta is not None
+        and selected_static_sharpe_delta >= 0
+        and selected_same_cash_sharpe_delta is not None
+        and selected_same_cash_sharpe_delta >= 0
         and negative_folds == 0
         and candidate_negative_folds == 0
-        and base_vs_random_median is not None
-        and base_vs_random_median >= 0
+        and random_beat_base_rate_sharpe is not None
+        and random_beat_base_rate_sharpe <= 0.25
+        and max(
+            base_random_percentile_sharpe
+            if base_random_percentile_sharpe is not None
+            else -1.0,
+            selected_random_percentile_sharpe
+            if selected_random_percentile_sharpe is not None
+            else -1.0,
+        )
+        >= 0.75
     ):
         return "PASS_DEFENSIVE_CANDIDATE", reasons
 
@@ -1399,6 +1452,7 @@ def _robustness_decision_summary(
     walk_forward = tables["walk_forward"]
     walkforward_candidate = tables.get("walkforward_candidate_selection", pd.DataFrame())
     parameter_sweep = tables["parameter_sweep"]
+    random_null = tables.get("random_null_model", pd.DataFrame())
 
     ew = _first_ok_row(active, "Benchmark", "EqualWeightRisk")
     static_ew = _first_ok_row(active, "Benchmark", "StaticMatched_EqualWeightRisk_Cash")
@@ -1717,36 +1771,6 @@ def _robustness_decision_summary(
         }
     )
 
-    asset_rows = parameter_sweep[
-        (parameter_sweep.get("VariantGroup", "") == "AssetSelection")
-        & (parameter_sweep.get("Status", "") == "OK")
-    ].copy()
-    if not asset_rows.empty:
-        asset_rows["Sharpe_Excess"] = pd.to_numeric(
-            asset_rows["Sharpe_Excess"], errors="coerce"
-        )
-        asset_rows["CAGR"] = pd.to_numeric(asset_rows["CAGR"], errors="coerce")
-        asset_rows = asset_rows.dropna(subset=["Sharpe_Excess"])
-
-    asset_base = _first_ok_row(parameter_sweep, "Label", "AssetSelection_Base")
-    asset_eq = _first_ok_row(parameter_sweep, "Label", "AssetSelection_EqualWeightSelected")
-    asset_top = _first_ok_row(parameter_sweep, "Label", "AssetSelection_TopMomentumOnly")
-    asset_min_vol = _first_ok_row(parameter_sweep, "Label", "AssetSelection_MinVolOnly")
-
-    best_asset = (
-        asset_rows.loc[asset_rows["Sharpe_Excess"].idxmax()]
-        if not asset_rows.empty
-        else None
-    )
-    random_rows = asset_rows[
-        asset_rows["Label"].astype(str).str.startswith("AssetSelection_RandomSameCashSeed_")
-    ].copy() if not asset_rows.empty else pd.DataFrame()
-    best_random = (
-        random_rows.loc[random_rows["Sharpe_Excess"].idxmax()]
-        if not random_rows.empty
-        else None
-    )
-
     def _variant_delta(
         left: Optional[pd.Series], right: Optional[pd.Series], key: str
     ) -> Optional[float]:
@@ -1756,43 +1780,184 @@ def _robustness_decision_summary(
             return None
         return left_value - right_value
 
+    asset_rows = parameter_sweep[
+        (parameter_sweep.get("VariantGroup", "") == "AssetSelection")
+        & (parameter_sweep.get("Status", "") == "OK")
+    ].copy()
+    candidate_rows = parameter_sweep[
+        (parameter_sweep.get("VariantRole", "") == "CANDIDATE")
+        & (parameter_sweep.get("Status", "") == "OK")
+    ].copy()
+    for rows_df in (asset_rows, candidate_rows):
+        if not rows_df.empty:
+            rows_df["Sharpe_Excess"] = pd.to_numeric(
+                rows_df["Sharpe_Excess"], errors="coerce"
+            )
+            rows_df["CAGR"] = pd.to_numeric(rows_df["CAGR"], errors="coerce")
+            rows_df["MaxDrawdown"] = pd.to_numeric(
+                rows_df["MaxDrawdown"], errors="coerce"
+            )
+            rows_df["Calmar"] = pd.to_numeric(rows_df["Calmar"], errors="coerce")
+
+    asset_candidate_rows = asset_rows[asset_rows.get("VariantRole", "") == "CANDIDATE"].copy()
+    asset_candidate_rows = asset_candidate_rows.dropna(subset=["Sharpe_Excess"])
+    candidate_rows = candidate_rows.dropna(subset=["Sharpe_Excess"])
+
+    asset_base = _first_ok_row(parameter_sweep, "Label", "AssetSelection_Base")
+    asset_eq = _first_ok_row(parameter_sweep, "Label", "AssetSelection_EqualWeightSelected")
+    asset_top = _first_ok_row(parameter_sweep, "Label", "AssetSelection_TopMomentumOnly")
+    asset_min_vol = _first_ok_row(parameter_sweep, "Label", "AssetSelection_MinVolOnly")
+
+    best_asset = (
+        asset_candidate_rows.loc[asset_candidate_rows["Sharpe_Excess"].idxmax()]
+        if not asset_candidate_rows.empty
+        else None
+    )
+    selected_candidate = (
+        candidate_rows.loc[candidate_rows["Sharpe_Excess"].idxmax()]
+        if not candidate_rows.empty
+        else None
+    )
+
     base_cagr = _variant_value(asset_base, "CAGR")
     base_sharpe = _variant_value(asset_base, "Sharpe_Excess")
-    random_median_cagr = (
-        float(random_rows["CAGR"].median()) if not random_rows.empty else None
-    )
-    random_median_sharpe = (
-        float(random_rows["Sharpe_Excess"].median()) if not random_rows.empty else None
-    )
-    random_best_cagr = _variant_value(best_random, "CAGR")
-    random_best_sharpe = _variant_value(best_random, "Sharpe_Excess")
+    base_calmar = _variant_value(asset_base, "Calmar")
+    selected_sharpe = _variant_value(selected_candidate, "Sharpe_Excess")
+    selected_maxdd = _variant_value(selected_candidate, "MaxDrawdown")
 
     asset_comparison_deltas = [
         _variant_delta(asset_base, asset_eq, "Sharpe_Excess"),
         _variant_delta(asset_base, asset_top, "Sharpe_Excess"),
         _variant_delta(asset_base, asset_min_vol, "Sharpe_Excess"),
     ]
+    base_beats_simple = all(
+        delta is not None and delta >= 0 for delta in asset_comparison_deltas
+    )
+
+    random_stats = random_null.copy()
+    if not random_stats.empty:
+        for col in ["CAGR", "Sharpe_Excess", "Calmar", "MaxDrawdown"]:
+            random_stats[col] = pd.to_numeric(random_stats[col], errors="coerce")
+    random_count = int(len(random_stats))
+    random_median_cagr = (
+        float(random_stats["CAGR"].median()) if random_count and "CAGR" in random_stats else None
+    )
+    random_median_sharpe = (
+        float(random_stats["Sharpe_Excess"].median())
+        if random_count and "Sharpe_Excess" in random_stats
+        else None
+    )
+    random_median_calmar = (
+        float(random_stats["Calmar"].median())
+        if random_count and "Calmar" in random_stats
+        else None
+    )
+    random_best_cagr = (
+        float(random_stats["CAGR"].max()) if random_count and "CAGR" in random_stats else None
+    )
+    random_best_sharpe = (
+        float(random_stats["Sharpe_Excess"].max())
+        if random_count and "Sharpe_Excess" in random_stats
+        else None
+    )
+    random_best_calmar = (
+        float(random_stats["Calmar"].max()) if random_count and "Calmar" in random_stats else None
+    )
+    random_worst_maxdd = (
+        float(random_stats["MaxDrawdown"].max())
+        if random_count and "MaxDrawdown" in random_stats
+        else None
+    )
+
+    def _random_percentile(metric: str, value: Optional[float]) -> Optional[float]:
+        if value is None or random_stats.empty or metric not in random_stats.columns:
+            return None
+        series = pd.to_numeric(random_stats[metric], errors="coerce").dropna()
+        if series.empty:
+            return None
+        return float((series <= value).mean())
+
+    def _random_beat_rate(metric: str, value: Optional[float]) -> Optional[float]:
+        if value is None or random_stats.empty or metric not in random_stats.columns:
+            return None
+        series = pd.to_numeric(random_stats[metric], errors="coerce").dropna()
+        if series.empty:
+            return None
+        return float((series > value).mean())
+
+    base_random_percentile_cagr = _random_percentile("CAGR", base_cagr)
+    base_random_percentile_sharpe = _random_percentile("Sharpe_Excess", base_sharpe)
+    base_random_percentile_calmar = _random_percentile("Calmar", base_calmar)
+    selected_random_percentile_sharpe = _random_percentile(
+        "Sharpe_Excess", selected_sharpe
+    )
+    random_beat_base_rate_cagr = _random_beat_rate("CAGR", base_cagr)
+    random_beat_base_rate_sharpe = _random_beat_rate("Sharpe_Excess", base_sharpe)
+    random_beat_base_rate_calmar = _random_beat_rate("Calmar", base_calmar)
+
     base_vs_random_median_sharpe = (
         base_sharpe - random_median_sharpe
         if base_sharpe is not None and random_median_sharpe is not None
         else None
     )
-    if base_sharpe is None:
-        asset_selection_decision = "NO_ASSET_SELECTION_DATA"
-    elif base_vs_random_median_sharpe is not None and base_vs_random_median_sharpe < 0:
-        asset_selection_decision = "RANDOM_MEDIAN_BEATS_BASE"
-    elif any(delta is not None and delta < 0 for delta in asset_comparison_deltas):
-        asset_selection_decision = "SIMPLE_VARIANT_BEATS_BASE"
-    elif base_vs_random_median_sharpe is not None and base_vs_random_median_sharpe >= 0:
-        asset_selection_decision = "BASE_BEATS_SIMPLE_AND_RANDOM"
+    base_vs_random_median_calmar = (
+        base_calmar - random_median_calmar
+        if base_calmar is not None and random_median_calmar is not None
+        else None
+    )
+    if base_random_percentile_sharpe is None:
+        asset_selection_decision = "INSUFFICIENT_DATA"
+    elif base_random_percentile_sharpe < 0.50:
+        asset_selection_decision = "BASE_FAILS_RANDOM_NULL"
+    elif base_random_percentile_sharpe >= 0.75 and base_beats_simple:
+        asset_selection_decision = "BASE_BEATS_SIMPLE_AND_RANDOM_NULL"
+    elif base_random_percentile_sharpe >= 0.75:
+        asset_selection_decision = "BASE_BEATS_RANDOM_NULL_BUT_SIMPLE_VARIANT_BEATS_BASE"
     else:
-        asset_selection_decision = "MIXED_ASSET_SELECTION"
+        asset_selection_decision = "INSUFFICIENT_DATA"
+
+    selected_candidate_static_delta = (
+        selected_sharpe - static_ew_sharpe
+        if selected_sharpe is not None and static_ew_sharpe is not None
+        else None
+    )
+    selected_candidate_same_cash_delta = (
+        selected_sharpe - same_ew_sharpe
+        if selected_sharpe is not None and same_ew_sharpe is not None
+        else None
+    )
+    selected_candidate_dd_reduction = (
+        _row_metric(ew, "Benchmark_MaxDD") - selected_maxdd
+        if selected_maxdd is not None and _row_metric(ew, "Benchmark_MaxDD") is not None
+        else None
+    )
 
     summary.update(
         {
             "BestAssetSelectionVariant": best_asset.get("Label") if best_asset is not None else None,
             "BestAssetSelectionVariant_Sharpe_Excess": _variant_value(best_asset, "Sharpe_Excess"),
             "BestAssetSelectionVariant_CAGR": _variant_value(best_asset, "CAGR"),
+            "SelectedCandidateVariant": (
+                selected_candidate.get("Label") if selected_candidate is not None else None
+            ),
+            "SelectedCandidateVariantGroup": (
+                selected_candidate.get("VariantGroup") if selected_candidate is not None else None
+            ),
+            "SelectedCandidate_Sharpe_Excess": selected_sharpe,
+            "SelectedCandidate_CAGR": _variant_value(selected_candidate, "CAGR"),
+            "SelectedCandidate_MaxDrawdown": selected_maxdd,
+            "SelectedCandidate_Sharpe_Delta_vs_StaticMatched_EqualWeightRisk_Cash": (
+                selected_candidate_static_delta
+            ),
+            "SelectedCandidate_Sharpe_Delta_vs_SameCashSchedule_EqualWeightRisk": (
+                selected_candidate_same_cash_delta
+            ),
+            "SelectedCandidate_Drawdown_Reduction_vs_EqualWeightRisk": (
+                selected_candidate_dd_reduction
+            ),
+            "SelectedCandidateRandomPercentile_Sharpe_Excess": (
+                selected_random_percentile_sharpe
+            ),
             "BaseVsEqualWeightSelected_CAGR_Delta": _variant_delta(asset_base, asset_eq, "CAGR"),
             "BaseVsEqualWeightSelected_Sharpe_Excess_Delta": _variant_delta(
                 asset_base, asset_eq, "Sharpe_Excess"
@@ -1811,21 +1976,21 @@ def _robustness_decision_summary(
                 else None
             ),
             "BaseVsRandomMedian_Sharpe_Excess_Delta": base_vs_random_median_sharpe,
-            "BaseVsRandomBest_CAGR_Delta": (
-                base_cagr - random_best_cagr
-                if base_cagr is not None and random_best_cagr is not None
-                else None
-            ),
-            "BaseVsRandomBest_Sharpe_Excess_Delta": (
-                base_sharpe - random_best_sharpe
-                if base_sharpe is not None and random_best_sharpe is not None
-                else None
-            ),
-            "RandomMedianAssetSelection_CAGR": random_median_cagr,
-            "RandomMedianAssetSelection_Sharpe_Excess": random_median_sharpe,
-            "BestRandomAssetSelectionVariant": (
-                best_random.get("Label") if best_random is not None else None
-            ),
+            "BaseVsRandomMedian_Calmar_Delta": base_vs_random_median_calmar,
+            "RandomNullSeedCount": random_count,
+            "RandomNullMedian_CAGR": random_median_cagr,
+            "RandomNullMedian_Sharpe_Excess": random_median_sharpe,
+            "RandomNullMedian_Calmar": random_median_calmar,
+            "RandomNullBest_CAGR": random_best_cagr,
+            "RandomNullBest_Sharpe_Excess": random_best_sharpe,
+            "RandomNullBest_Calmar": random_best_calmar,
+            "RandomNullWorst_MaxDD": random_worst_maxdd,
+            "BaseRandomPercentile_CAGR": base_random_percentile_cagr,
+            "BaseRandomPercentile_Sharpe_Excess": base_random_percentile_sharpe,
+            "BaseRandomPercentile_Calmar": base_random_percentile_calmar,
+            "RandomBeatBaseRate_CAGR": random_beat_base_rate_cagr,
+            "RandomBeatBaseRate_Sharpe_Excess": random_beat_base_rate_sharpe,
+            "RandomBeatBaseRate_Calmar": random_beat_base_rate_calmar,
             "AssetSelectionDecision": asset_selection_decision,
         }
     )
@@ -1911,7 +2076,19 @@ def _write_summary_markdown(outdir: Path, summary: Dict[str, object]) -> None:
         f"- Base vs top momentum Sharpe delta: {_fmt_metric(summary.get('BaseVsTopMomentum_Sharpe_Excess_Delta'))}",
         f"- Base vs min-vol Sharpe delta: {_fmt_metric(summary.get('BaseVsMinVol_Sharpe_Excess_Delta'))}",
         f"- Base vs median random Sharpe delta: {_fmt_metric(summary.get('BaseVsRandomMedian_Sharpe_Excess_Delta'))}",
-        f"- Base vs best random Sharpe delta: {_fmt_metric(summary.get('BaseVsRandomBest_Sharpe_Excess_Delta'))}",
+        f"- Selected non-diagnostic candidate: {summary.get('SelectedCandidateVariant')}",
+        f"- Selected candidate static-matched Sharpe delta: {_fmt_metric(summary.get('SelectedCandidate_Sharpe_Delta_vs_StaticMatched_EqualWeightRisk_Cash'))}",
+        f"- Selected candidate same-cash Sharpe delta: {_fmt_metric(summary.get('SelectedCandidate_Sharpe_Delta_vs_SameCashSchedule_EqualWeightRisk'))}",
+        "",
+        "## Random Null Model",
+        "",
+        f"- Random null seed count: {summary.get('RandomNullSeedCount')}",
+        f"- Random median excess Sharpe: {_fmt_metric(summary.get('RandomNullMedian_Sharpe_Excess'))}",
+        f"- Random best excess Sharpe: {_fmt_metric(summary.get('RandomNullBest_Sharpe_Excess'))}",
+        f"- Base excess-Sharpe percentile: {_fmt_metric(summary.get('BaseRandomPercentile_Sharpe_Excess'), pct=True)}",
+        f"- Selected candidate excess-Sharpe percentile: {_fmt_metric(summary.get('SelectedCandidateRandomPercentile_Sharpe_Excess'), pct=True)}",
+        f"- Random beat-base rate, excess Sharpe: {_fmt_metric(summary.get('RandomBeatBaseRate_Sharpe_Excess'), pct=True)}",
+        f"- Base vs random median Calmar delta: {_fmt_metric(summary.get('BaseVsRandomMedian_Calmar_Delta'))}",
         "",
         "## Benchmarks",
         "",
@@ -2147,6 +2324,12 @@ def _variant_group(name: str) -> str:
     return "ParameterSweep"
 
 
+def _variant_role(name: str) -> str:
+    if name.startswith("AssetSelection_RandomSameCashSeed_"):
+        return "DIAGNOSTIC_ONLY"
+    return "CANDIDATE"
+
+
 def _variant_avg_cash_weight(res: BacktestResult, config: MatvmConfig) -> float:
     if config.cash_ticker not in res.weights.columns or res.weights.empty:
         return float("nan")
@@ -2161,7 +2344,11 @@ def _parameter_sweep_table(
     rows = []
     for name, res in results.items():
         cfg = variant_configs.get(name)
-        extra: Dict[str, object] = {"Trades": int(len(res.trades)), "VariantGroup": _variant_group(name)}
+        extra: Dict[str, object] = {
+            "Trades": int(len(res.trades)),
+            "VariantGroup": _variant_group(name),
+            "VariantRole": _variant_role(name),
+        }
         if cfg is not None:
             avg_cash = _variant_avg_cash_weight(res, cfg)
             extra.update(
@@ -2996,6 +3183,192 @@ def _plot_defensive_benchmark_charts(
     return paths
 
 
+def _random_null_signal_schedule(
+    prices: pd.DataFrame,
+    config: MatvmConfig,
+) -> List[Tuple[pd.Timestamp, pd.Timestamp, List[str]]]:
+    signal_dates = pd.DatetimeIndex(
+        prices.index.to_series().resample(config.rebalance_freq).last().dropna().values
+    )
+    signal_set = set(signal_dates)
+    strategy = MatvmStrategy(config=config)
+    schedule: List[Tuple[pd.Timestamp, pd.Timestamp, List[str]]] = []
+    idx = prices.index
+
+    for i, dt in enumerate(idx):
+        if dt not in signal_set:
+            continue
+        if i + 1 >= len(idx):
+            continue
+        if len(prices.loc[:dt]) < config.required_history_days():
+            schedule.append((idx[i + 1], dt, []))
+            continue
+
+        q, _sigma, sma200 = strategy._compute_q_scores(prices, dt)
+        p0 = prices.loc[dt, config.risk_tickers]
+        trend = p0 > sma200
+        e_raw = ((q > 0.0) & trend).astype(int)
+        e_hyst = strategy._update_hysteresis(e_raw)
+        active = [
+            ticker
+            for ticker in config.risk_tickers
+            if float(e_hyst.get(ticker, 0.0)) > 0.0
+        ]
+        schedule.append((idx[i + 1], dt, active))
+
+    return schedule
+
+
+def _random_null_target_weights(
+    config: MatvmConfig,
+    seed: int,
+    signal_date: pd.Timestamp,
+    active: Sequence[str],
+) -> pd.Series:
+    target = pd.Series(0.0, index=config.all_tickers(), dtype=float)
+    fixed_cash = 0.0 if config.fixed_cash_weight is None else float(config.fixed_cash_weight)
+    fixed_cash = min(max(fixed_cash, 0.0), 1.0)
+
+    if not active:
+        target[config.cash_ticker] = 1.0
+        return target
+
+    day_key = int(pd.Timestamp(signal_date).strftime("%Y%m%d"))
+    rng = np.random.default_rng(int(seed) * 1_000_003 + day_key)
+    chosen = str(rng.choice(list(active)))
+    target[chosen] = 1.0 - fixed_cash
+    target[config.cash_ticker] = fixed_cash
+    return target / target.sum()
+
+
+def _simulate_random_null_seed(
+    returns: pd.DataFrame,
+    config: MatvmConfig,
+    schedule: Sequence[Tuple[pd.Timestamp, pd.Timestamp, List[str]]],
+    seed: int,
+) -> Tuple[pd.Series, pd.Series]:
+    tickers = config.all_tickers()
+    targets = {
+        trade_date: _random_null_target_weights(
+            config=config,
+            seed=seed,
+            signal_date=signal_date,
+            active=active,
+        )
+        for trade_date, signal_date, active in schedule
+    }
+
+    w_current = pd.Series(0.0, index=tickers, dtype=float)
+    w_current[config.cash_ticker] = 1.0
+    value = 1.0
+    cost_rate = (config.tcost_bps + config.slippage_bps) / 10_000.0
+
+    equity: List[float] = []
+    cash_weights: List[float] = []
+    idx = returns.index
+
+    for i, dt in enumerate(idx):
+        if i > 0:
+            daily_return = float((w_current * returns.loc[dt, tickers]).sum())
+            value *= 1.0 + daily_return
+
+        target = targets.get(dt)
+        if target is not None:
+            diff = (target - w_current).abs()
+            rel = diff / (w_current.abs() + 1e-12)
+            trigger = (diff > config.rebalance_abs_threshold) | (
+                rel > config.rebalance_rel_threshold
+            )
+            if bool(trigger.any()):
+                turnover = 0.5 * float(diff.sum())
+                value *= max(0.0, 1.0 - turnover * cost_rate)
+                w_current = target.copy()
+
+        equity.append(value)
+        cash_weights.append(float(w_current.get(config.cash_ticker, 0.0)))
+
+    return (
+        pd.Series(equity, index=idx, name=f"random_null_{seed}"),
+        pd.Series(cash_weights, index=idx, name=f"cash_weight_{seed}"),
+    )
+
+
+def _random_null_model_table(
+    prices: pd.DataFrame,
+    config: MatvmConfig,
+    daily_rf: pd.Series,
+    base_result: BacktestResult,
+    baseline_avg_cash_weight: float,
+    seed_count: int,
+) -> pd.DataFrame:
+    seed_count = max(int(seed_count), 0)
+    columns = [
+        "Seed",
+        "CAGR",
+        "MaxDrawdown",
+        "Sharpe_RF0",
+        "Sharpe_Excess",
+        "Sortino_RF0",
+        "Sortino_Excess",
+        "Calmar",
+        "AvgCashWeight",
+        "PercentTimeInCash",
+        "BeatsBase_CAGR",
+        "BeatsBase_Sharpe_Excess",
+        "BeatsBase_Calmar",
+        "BeatsBase_MaxDD",
+    ]
+    if seed_count <= 0:
+        return pd.DataFrame(columns=columns)
+
+    null_config = _clone_config(
+        config,
+        cash_policy="fixed",
+        fixed_cash_weight=float(min(max(baseline_avg_cash_weight, 0.0), 1.0)),
+        asset_selection_mode="random_selected",
+    )
+    returns = _benchmark_return_frame(prices, null_config).reindex(prices.index).fillna(0.0)
+    for ticker in null_config.all_tickers():
+        if ticker not in returns.columns:
+            returns[ticker] = 0.0
+    returns = returns[null_config.all_tickers()]
+
+    schedule = _random_null_signal_schedule(prices=prices, config=null_config)
+    base_stats = _stats_from_equity(base_result.equity_curve, daily_rf=daily_rf)
+
+    rows = []
+    for seed in range(1, seed_count + 1):
+        equity, cash_weights = _simulate_random_null_seed(
+            returns=returns,
+            config=null_config,
+            schedule=schedule,
+            seed=seed,
+        )
+        stats = _stats_from_equity(equity, daily_rf=daily_rf)
+        rows.append(
+            {
+                "Seed": seed,
+                "CAGR": stats.get("CAGR"),
+                "MaxDrawdown": stats.get("MaxDrawdown"),
+                "Sharpe_RF0": stats.get("Sharpe_RF0"),
+                "Sharpe_Excess": stats.get("Sharpe_Excess"),
+                "Sortino_RF0": stats.get("Sortino_RF0"),
+                "Sortino_Excess": stats.get("Sortino_Excess"),
+                "Calmar": stats.get("Calmar"),
+                "AvgCashWeight": float(cash_weights.mean()),
+                "PercentTimeInCash": float((cash_weights > 1e-6).mean()),
+                "BeatsBase_CAGR": stats.get("CAGR") > base_stats.get("CAGR"),
+                "BeatsBase_Sharpe_Excess": stats.get("Sharpe_Excess")
+                > base_stats.get("Sharpe_Excess"),
+                "BeatsBase_Calmar": stats.get("Calmar") > base_stats.get("Calmar"),
+                "BeatsBase_MaxDD": stats.get("MaxDrawdown")
+                < base_stats.get("MaxDrawdown"),
+            }
+        )
+
+    return pd.DataFrame(rows, columns=columns)
+
+
 def _walk_forward_table(
     results: Dict[str, BacktestResult],
     prices: pd.DataFrame,
@@ -3020,6 +3393,8 @@ def _walk_forward_table(
 
         scored: List[Tuple[float, str, Dict[str, float]]] = []
         for name, res in results.items():
+            if _variant_role(name) == "DIAGNOSTIC_ONLY":
+                continue
             train_equity = res.equity_curve.loc[fold_train_start:train_end]
             if len(train_equity) < 2:
                 continue
@@ -3073,7 +3448,11 @@ def _walk_forward_candidate_selection_table(
     data_end = prices.index[-1]
     fold_train_start = data_start
     fold_num = 1
-    candidate_names = [name for name in WALK_FORWARD_CANDIDATE_VARIANTS if name in results]
+    candidate_names = [
+        name
+        for name in WALK_FORWARD_CANDIDATE_VARIANTS
+        if name in results and _variant_role(name) != "DIAGNOSTIC_ONLY"
+    ]
     if "baseline" not in results or not candidate_names:
         return pd.DataFrame(rows)
 
@@ -3153,6 +3532,7 @@ def run_robustness_analysis(
     score_metric: str = "Sharpe_Excess",
     backtest_status: str = "UNKNOWN",
     data_audit_status: str = "UNKNOWN",
+    random_null_seeds: int = DEFAULT_RANDOM_NULL_SEEDS,
 ) -> Dict[str, pd.DataFrame]:
     prices = _ensure_datetime_index(prices).sort_index()
     required = config.required_price_tickers()
@@ -3180,6 +3560,14 @@ def run_robustness_analysis(
             results=variant_results,
             daily_rf=daily_rf,
             variant_configs=variant_configs,
+        ),
+        "random_null_model": _random_null_model_table(
+            prices=prices,
+            config=config,
+            daily_rf=daily_rf,
+            base_result=variant_results["AssetSelection_Base"],
+            baseline_avg_cash_weight=baseline_avg_cash,
+            seed_count=random_null_seeds,
         ),
         "regimes": _regime_table(
             baseline=baseline,
@@ -3922,6 +4310,7 @@ def cli_robustness(args: argparse.Namespace) -> None:
         score_metric=args.score_metric,
         backtest_status=backtest_status,
         data_audit_status=data_audit_status,
+        random_null_seeds=int(args.random_null_seeds),
     )
 
     print("\n=== Robustness status ===")
@@ -3969,6 +4358,12 @@ def cli_robustness(args: argparse.Namespace) -> None:
     print(f"{'Base vs TopMom Sharpe':>22}: {_fmt_metric(summary.get('BaseVsTopMomentum_Sharpe_Excess_Delta'))}")
     print(f"{'Base vs MinVol Sharpe':>22}: {_fmt_metric(summary.get('BaseVsMinVol_Sharpe_Excess_Delta'))}")
     print(f"{'Base vs RandMed':>22}: {_fmt_metric(summary.get('BaseVsRandomMedian_Sharpe_Excess_Delta'))}")
+    print(f"{'Selected candidate':>22}: {summary.get('SelectedCandidateVariant')}")
+    print(f"{'Sel vs static Sharpe':>22}: {_fmt_metric(summary.get('SelectedCandidate_Sharpe_Delta_vs_StaticMatched_EqualWeightRisk_Cash'))}")
+    print(f"{'Sel vs same Sharpe':>22}: {_fmt_metric(summary.get('SelectedCandidate_Sharpe_Delta_vs_SameCashSchedule_EqualWeightRisk'))}")
+    print(f"{'Random null seeds':>22}: {summary.get('RandomNullSeedCount')}")
+    print(f"{'Base random pctile':>22}: {_fmt_metric(summary.get('BaseRandomPercentile_Sharpe_Excess'), pct=True)}")
+    print(f"{'Random beat base':>22}: {_fmt_metric(summary.get('RandomBeatBaseRate_Sharpe_Excess'), pct=True)}")
     print(f"{'WF negative folds':>22}: {summary.get('WalkForwardNegativeFoldCount')}")
     print(f"{'WF cand neg folds':>22}: {summary.get('WalkForwardCandidateNegativeFoldCount')}")
     print(f"{'WF cand mean Sharpe':>22}: {_fmt_metric(summary.get('WalkForwardCandidateMeanSharpe'))}")
@@ -4006,6 +4401,7 @@ def cli_robustness(args: argparse.Namespace) -> None:
     display_cols = [
         "Label",
         "VariantGroup",
+        "VariantRole",
         "CashPolicy",
         "FixedCashWeight",
         "AvgCashWeight",
@@ -4240,6 +4636,12 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["Sharpe_Excess", "Sharpe_RF0", "Calmar", "CAGR"],
         default="Sharpe_Excess",
         help="Metric used to select variants in walk-forward analysis",
+    )
+    r.add_argument(
+        "--random-null-seeds",
+        type=int,
+        default=DEFAULT_RANDOM_NULL_SEEDS,
+        help="Number of random same-cash null-model seeds to evaluate",
     )
     r.add_argument("--outdir", default="./matvm_out/robustness")
     r.add_argument(
