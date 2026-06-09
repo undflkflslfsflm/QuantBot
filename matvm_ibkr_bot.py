@@ -32,6 +32,8 @@ TRADING_DAYS_PER_YEAR = 252
 RISK_FREE_MODES = {"zero", "constant", "ticker"}
 CASH_RETURN_MODES = {"zero", "constant", "ticker"}
 MIN_DAILY_RETURN_STD = 1e-5
+DECISION_MIN_EXCESS_SHARPE = 0.50
+DECISION_MATERIAL_DD_REDUCTION = 0.08
 
 
 def _dt_utc_now() -> datetime:
@@ -1024,6 +1026,239 @@ def _add_run_metadata(df: pd.DataFrame, metadata: Dict[str, object]) -> pd.DataF
     return out
 
 
+def _json_value(value: object) -> object:
+    if isinstance(value, (np.floating, float)):
+        value = float(value)
+        return None if np.isnan(value) or np.isinf(value) else value
+    if isinstance(value, (np.integer, int)):
+        return int(value)
+    if isinstance(value, dict):
+        return {str(k): _json_value(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_json_value(v) for v in value]
+    return value
+
+
+def _metric_value(value: object) -> Optional[float]:
+    try:
+        out = float(value)
+    except Exception:
+        return None
+    if np.isnan(out) or np.isinf(out):
+        return None
+    return out
+
+
+def _run_mode(config: MatvmConfig) -> str:
+    if config.cash_return_mode == "constant":
+        cash = f"cash=constant:{config.annual_cash_return_rate:.2%}"
+    elif config.cash_return_mode == "ticker":
+        cash = f"cash=ticker:{config.cash_return_ticker}"
+    else:
+        cash = "cash=zero"
+
+    if config.risk_free_mode == "constant":
+        rf = f"rf=constant:{config.annual_risk_free_rate:.2%}"
+    elif config.risk_free_mode == "ticker":
+        rf = f"rf=ticker:{config.risk_free_ticker}"
+    else:
+        rf = "rf=zero"
+
+    return f"{cash}; {rf}"
+
+
+def _first_ok_row(df: pd.DataFrame, key: str, value: str) -> Optional[pd.Series]:
+    if df.empty or key not in df.columns:
+        return None
+    rows = df[(df[key] == value) & (df.get("Status", "") == "OK")]
+    if rows.empty:
+        return None
+    return rows.iloc[0]
+
+
+def _best_benchmark(df: pd.DataFrame, metric: str, mode: str) -> Optional[str]:
+    if df.empty or metric not in df.columns:
+        return None
+
+    candidates = df[df.get("Status", "") == "OK"].copy()
+    if "BenchmarkNote" in candidates.columns:
+        candidates = candidates[candidates["BenchmarkNote"] != "DIAGNOSTIC_ONLY"]
+    candidates[metric] = pd.to_numeric(candidates[metric], errors="coerce")
+    candidates = candidates.dropna(subset=[metric])
+    if candidates.empty:
+        return None
+
+    if mode == "min":
+        row = candidates.loc[candidates[metric].idxmin()]
+    else:
+        row = candidates.loc[candidates[metric].idxmax()]
+    return str(row.get("Label") or row.get("Benchmark"))
+
+
+def _classify_strategy(summary: Dict[str, object]) -> Tuple[str, List[str]]:
+    reasons: List[str] = []
+
+    if summary.get("DataAuditStatus") != "PASS":
+        return "DIAGNOSTIC_ONLY", ["Data audit did not pass"]
+
+    worst_wf = _metric_value(summary.get("WalkForwardWorstSharpe"))
+    negative_folds = int(summary.get("WalkForwardNegativeFoldCount") or 0)
+    strategy_sharpe = _metric_value(summary.get("Strategy_Sharpe_Excess"))
+    ew_sharpe_delta = _metric_value(summary.get("EqualWeightRisk_Sharpe_Delta"))
+    ew_dd_reduction = _metric_value(summary.get("EqualWeightRisk_Drawdown_Reduction"))
+
+    if negative_folds > 0:
+        reasons.append("At least one walk-forward fold has negative excess Sharpe")
+    if worst_wf is not None:
+        reasons.append(f"Worst walk-forward excess Sharpe is {worst_wf:.3f}")
+    if strategy_sharpe is None or strategy_sharpe < DECISION_MIN_EXCESS_SHARPE:
+        reasons.append(
+            f"Strategy excess Sharpe is below {DECISION_MIN_EXCESS_SHARPE:.2f}"
+        )
+    if ew_sharpe_delta is not None and ew_sharpe_delta < 0:
+        reasons.append("Strategy underperforms EqualWeightRisk on excess Sharpe")
+    if ew_dd_reduction is not None and ew_dd_reduction >= DECISION_MATERIAL_DD_REDUCTION:
+        reasons.append("Strategy materially reduces drawdown versus EqualWeightRisk")
+
+    if (
+        strategy_sharpe is not None
+        and strategy_sharpe >= DECISION_MIN_EXCESS_SHARPE
+        and ew_dd_reduction is not None
+        and ew_dd_reduction >= DECISION_MATERIAL_DD_REDUCTION
+        and negative_folds == 0
+    ):
+        return "PASS_DEFENSIVE_CANDIDATE", reasons
+
+    if ew_dd_reduction is not None and ew_dd_reduction >= DECISION_MATERIAL_DD_REDUCTION:
+        return "MIXED_DEFENSIVE_CANDIDATE", reasons
+
+    return "FAIL_OR_WEAK", reasons
+
+
+def _fmt_metric(value: object, pct: bool = False) -> str:
+    number = _metric_value(value)
+    if number is None:
+        return "n/a"
+    return f"{number:.2%}" if pct else f"{number:.3f}"
+
+
+def _robustness_decision_summary(
+    config: MatvmConfig,
+    baseline: BacktestResult,
+    tables: Dict[str, pd.DataFrame],
+    metadata: Dict[str, object],
+    effective_start: str,
+    effective_end: str,
+) -> Dict[str, object]:
+    active = tables["active_benchmarks"]
+    benchmarks = tables["benchmarks"]
+    walk_forward = tables["walk_forward"]
+
+    ew = _first_ok_row(active, "Benchmark", "EqualWeightRisk")
+    wf_sharpe = (
+        pd.to_numeric(walk_forward["Sharpe_Excess"], errors="coerce").dropna()
+        if "Sharpe_Excess" in walk_forward.columns
+        else pd.Series(dtype=float)
+    )
+
+    summary: Dict[str, object] = {
+        "RunMode": _run_mode(config),
+        "GitCommit": metadata.get("GitCommit"),
+        "DataAuditStatus": metadata.get("DataAuditStatus"),
+        "BacktestStatus": metadata.get("BacktestStatus"),
+        "CashExecution": config.cash_ticker,
+        "CashReturnMode": config.cash_return_mode,
+        "CashReturnTicker": config.cash_return_ticker,
+        "AnnualCashReturnRate": float(config.annual_cash_return_rate),
+        "RiskFreeMode": config.risk_free_mode,
+        "RiskFreeTicker": config.risk_free_ticker,
+        "AnnualRiskFreeRate": float(config.annual_risk_free_rate),
+        "ActualStart": effective_start,
+        "ActualEnd": effective_end,
+        "Strategy_CAGR": baseline.stats.get("CAGR"),
+        "Strategy_MaxDD": baseline.stats.get("MaxDrawdown"),
+        "Strategy_Sharpe_Excess": baseline.stats.get("Sharpe_Excess"),
+        "Strategy_Calmar": baseline.stats.get("Calmar"),
+        "BestBenchmarkBySharpe": _best_benchmark(benchmarks, "Sharpe_Excess", "max"),
+        "BestBenchmarkByCAGR": _best_benchmark(benchmarks, "CAGR", "max"),
+        "BestBenchmarkByDrawdown": _best_benchmark(benchmarks, "MaxDrawdown", "min"),
+        "WalkForwardWorstSharpe": float(wf_sharpe.min()) if not wf_sharpe.empty else None,
+        "WalkForwardNegativeFoldCount": int((wf_sharpe < 0).sum()) if not wf_sharpe.empty else 0,
+    }
+
+    if ew is not None:
+        summary.update(
+            {
+                "EqualWeightRisk_CAGR_Delta": ew.get("Active_CAGR"),
+                "EqualWeightRisk_Sharpe_Delta": ew.get("Active_Sharpe_Excess"),
+                "EqualWeightRisk_Drawdown_Reduction": ew.get("Drawdown_Reduction"),
+            }
+        )
+    else:
+        summary.update(
+            {
+                "EqualWeightRisk_CAGR_Delta": None,
+                "EqualWeightRisk_Sharpe_Delta": None,
+                "EqualWeightRisk_Drawdown_Reduction": None,
+            }
+        )
+
+    decision, reasons = _classify_strategy(summary)
+    summary["Decision"] = decision
+    summary["Reason"] = reasons
+    return {str(k): _json_value(v) for k, v in summary.items()}
+
+
+def _write_summary_markdown(outdir: Path, summary: Dict[str, object]) -> None:
+    reasons = summary.get("Reason") or []
+    if not isinstance(reasons, list):
+        reasons = [str(reasons)]
+
+    lines = [
+        "# Robustness Decision Summary",
+        "",
+        f"Decision: {summary.get('Decision')}",
+        f"Run mode: {summary.get('RunMode')}",
+        f"Git commit: {summary.get('GitCommit')}",
+        f"Data audit status: {summary.get('DataAuditStatus')}",
+        f"Backtest status: {summary.get('BacktestStatus')}",
+        "",
+        "## Key Metrics",
+        "",
+        f"- Actual period: {summary.get('ActualStart')} to {summary.get('ActualEnd')}",
+        f"- Strategy CAGR: {_fmt_metric(summary.get('Strategy_CAGR'), pct=True)}",
+        f"- Strategy max drawdown: {_fmt_metric(summary.get('Strategy_MaxDD'), pct=True)}",
+        f"- Strategy excess Sharpe: {_fmt_metric(summary.get('Strategy_Sharpe_Excess'))}",
+        f"- Strategy Calmar: {_fmt_metric(summary.get('Strategy_Calmar'))}",
+        "",
+        "## EqualWeightRisk Comparison",
+        "",
+        f"- Active CAGR: {_fmt_metric(summary.get('EqualWeightRisk_CAGR_Delta'), pct=True)}",
+        f"- Active excess Sharpe: {_fmt_metric(summary.get('EqualWeightRisk_Sharpe_Delta'))}",
+        f"- Drawdown reduction: {_fmt_metric(summary.get('EqualWeightRisk_Drawdown_Reduction'), pct=True)}",
+        "",
+        "## Benchmarks",
+        "",
+        f"- Best by excess Sharpe: {summary.get('BestBenchmarkBySharpe')}",
+        f"- Best by CAGR: {summary.get('BestBenchmarkByCAGR')}",
+        f"- Best by lowest drawdown: {summary.get('BestBenchmarkByDrawdown')}",
+        "",
+        "## Walk Forward",
+        "",
+        f"- Worst excess Sharpe: {_fmt_metric(summary.get('WalkForwardWorstSharpe'))}",
+        f"- Negative fold count: {summary.get('WalkForwardNegativeFoldCount')}",
+        "",
+        "## Reasons",
+        "",
+    ]
+    if reasons:
+        lines.extend([f"- {reason}" for reason in reasons])
+    else:
+        lines.append("- No gate warnings.")
+
+    (outdir / "robustness_summary.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
 def _robustness_variants(base_config: MatvmConfig) -> List[Tuple[str, MatvmConfig]]:
     definitions: List[Tuple[str, Dict[str, object]]] = [
         ("baseline", {}),
@@ -1420,6 +1655,14 @@ def run_robustness_analysis(
         data_audit_status=data_audit_status,
         git_commit=git_commit,
     )
+    decision_summary = _robustness_decision_summary(
+        config=config,
+        baseline=baseline,
+        tables=tables,
+        metadata=metadata,
+        effective_start=str(prices.index[0].date()),
+        effective_end=str(prices.index[-1].date()),
+    )
     tables = {name: _add_run_metadata(df, metadata) for name, df in tables.items()}
 
     outdir.mkdir(parents=True, exist_ok=True)
@@ -1428,24 +1671,15 @@ def run_robustness_analysis(
 
     summary = {
         "run_at_utc": _dt_utc_now().isoformat(),
-        "effective_start": str(prices.index[0].date()),
-        "effective_end": str(prices.index[-1].date()),
-        "risk_free_mode": config.risk_free_mode,
-        "risk_free_ticker": config.risk_free_ticker,
-        "cash_ticker": config.cash_ticker,
-        "cash_return_mode": config.cash_return_mode,
-        "cash_return_ticker": config.cash_return_ticker,
-        "annual_cash_return_rate": config.annual_cash_return_rate,
-        "backtest_status": backtest_status,
-        "data_audit_status": data_audit_status,
-        "git_commit": git_commit,
         "score_metric": score_metric,
         "tables": {name: f"robustness_{name}.csv" for name in tables},
     }
+    summary.update(decision_summary)
     (outdir / "robustness_summary.json").write_text(
-        json.dumps(summary, indent=2, sort_keys=True),
+        json.dumps(_json_value(summary), indent=2, sort_keys=True),
         encoding="utf-8",
     )
+    _write_summary_markdown(outdir, decision_summary)
     return tables
 
 
@@ -2099,7 +2333,7 @@ def cli_robustness(args: argparse.Namespace) -> None:
     start_dates = _parse_date_list(args.start_dates)
     outdir = Path(args.outdir)
     backtest_status = "DIAGNOSTIC ONLY" if audit.has_issues() else "CLEAN DATA CHECK PASSED"
-    data_audit_status = "WARNINGS" if audit.warnings else "CLEAN"
+    data_audit_status = "WARNINGS" if audit.warnings else "PASS"
     tables = run_robustness_analysis(
         prices=prices,
         config=cfg,
@@ -2127,6 +2361,18 @@ def cli_robustness(args: argparse.Namespace) -> None:
     if cfg.risk_free_mode == "ticker":
         print(f"{'Risk-free ticker':>22}: {cfg.risk_free_ticker}")
     print(f"{'Output folder':>22}: {outdir.resolve()}")
+
+    summary_path = outdir / "robustness_summary.json"
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    print("\n=== Decision summary ===")
+    print(f"{'Decision':>22}: {summary.get('Decision')}")
+    print(f"{'Strategy excess Sharpe':>22}: {_fmt_metric(summary.get('Strategy_Sharpe_Excess'))}")
+    print(f"{'EW Risk Sharpe delta':>22}: {_fmt_metric(summary.get('EqualWeightRisk_Sharpe_Delta'))}")
+    print(f"{'EW Risk DD reduction':>22}: {_fmt_metric(summary.get('EqualWeightRisk_Drawdown_Reduction'), pct=True)}")
+    print(f"{'WF negative folds':>22}: {summary.get('WalkForwardNegativeFoldCount')}")
+    reasons = summary.get("Reason") or []
+    if reasons:
+        print(f"{'Primary reason':>22}: {reasons[0]}")
 
     display_cols = [
         "Label",
