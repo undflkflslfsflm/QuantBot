@@ -31,6 +31,7 @@ except Exception:
 TRADING_DAYS_PER_YEAR = 252
 RISK_FREE_MODES = {"zero", "constant", "ticker"}
 CASH_RETURN_MODES = {"zero", "constant", "ticker"}
+CASH_POLICY_MODES = {"dynamic", "fixed"}
 MIN_DAILY_RETURN_STD = 1e-5
 DECISION_MIN_EXCESS_SHARPE = 0.50
 DECISION_MATERIAL_DD_REDUCTION = 0.08
@@ -188,6 +189,8 @@ class MatvmConfig:
     weight_cap: float = 0.35
     cov_shrink_lambda: float = 0.50
     vol_target: float = 0.08  # annualized
+    cash_policy: str = "dynamic"  # "dynamic" or "fixed"; research variants only
+    fixed_cash_weight: Optional[float] = None
 
     # Capital preservation overlay (drawdown thresholds)
     dd_half: float = 0.08
@@ -493,20 +496,32 @@ class MatvmStrategy:
         # Cap concentration; leftover becomes cash
         capped = self._cap_weights(base, cap=float(self.cfg.weight_cap))
 
-        # Vol targeting (no leverage: scale down only)
-        port_vol = self._portfolio_vol(prices, asof, capped)
-        if port_vol <= 0:
-            a = 1.0
+        cash_policy = str(self.cfg.cash_policy).strip().lower()
+        if cash_policy not in CASH_POLICY_MODES:
+            raise ValueError(f"Unknown cash_policy: {self.cfg.cash_policy}")
+
+        if cash_policy == "fixed":
+            fixed_cash = 0.0 if self.cfg.fixed_cash_weight is None else float(self.cfg.fixed_cash_weight)
+            fixed_cash = min(max(fixed_cash, 0.0), 1.0)
+            if capped.sum() > 0:
+                w_risk = capped / capped.sum() * (1.0 - fixed_cash)
+            else:
+                w_risk = capped.copy()
         else:
-            a = min(1.0, float(self.cfg.vol_target) / port_vol)
+            # Vol targeting (no leverage: scale down only)
+            port_vol = self._portfolio_vol(prices, asof, capped)
+            if port_vol <= 0:
+                a = 1.0
+            else:
+                a = min(1.0, float(self.cfg.vol_target) / port_vol)
 
-        w_risk = capped * a
+            w_risk = capped * a
 
-        # Drawdown circuit breaker
-        peak_equity = max(float(peak_equity), 1e-12)
-        dd = 1.0 - float(equity) / peak_equity
-        k = self._risk_multiplier(dd=dd, breadth_good=breadth_good)
-        w_risk *= k
+            # Drawdown circuit breaker
+            peak_equity = max(float(peak_equity), 1e-12)
+            dd = 1.0 - float(equity) / peak_equity
+            k = self._risk_multiplier(dd=dd, breadth_good=breadth_good)
+            w_risk *= k
 
         # Assemble full weights
         w = pd.Series(0.0, index=self.cfg.all_tickers(), dtype=float)
@@ -1145,6 +1160,10 @@ def _classify_strategy(summary: Dict[str, object]) -> Tuple[str, List[str]]:
     same_cash_sharpe_delta = _metric_value(summary.get("SameCashSchedule_Sharpe_Excess_Delta"))
     cash_timing = _metric_value(summary.get("CashTimingContribution"))
     asset_selection = _metric_value(summary.get("AssetSelectionContribution"))
+    dynamic_cash_policy_delta = _metric_value(
+        summary.get("DynamicCashTiming_Sharpe_Delta_vs_BestCashPolicy")
+    )
+    best_cash_policy = summary.get("BestCashPolicyVariant")
 
     if negative_folds > 0:
         reasons.append("At least one walk-forward fold has negative excess Sharpe")
@@ -1183,6 +1202,15 @@ def _classify_strategy(summary: Dict[str, object]) -> Tuple[str, List[str]]:
             reasons.append("Asset selection contribution is positive versus same cash schedule")
         elif asset_selection < 0:
             reasons.append("Asset selection contribution is negative versus same cash schedule")
+    if dynamic_cash_policy_delta is not None:
+        if dynamic_cash_policy_delta > 1e-6:
+            reasons.append("Dynamic cash timing adds value versus tested cash-policy variants")
+        elif dynamic_cash_policy_delta < -1e-6:
+            reasons.append(
+                f"Dynamic cash timing destroys value versus best cash policy: {best_cash_policy}"
+            )
+        else:
+            reasons.append(f"Dynamic cash timing is tied with best cash policy: {best_cash_policy}")
 
     if (
         strategy_sharpe is not None
@@ -1221,6 +1249,7 @@ def _robustness_decision_summary(
     active = tables["active_benchmarks"]
     benchmarks = tables["benchmarks"]
     walk_forward = tables["walk_forward"]
+    parameter_sweep = tables["parameter_sweep"]
 
     ew = _first_ok_row(active, "Benchmark", "EqualWeightRisk")
     static_ew = _first_ok_row(active, "Benchmark", "StaticMatched_EqualWeightRisk_Cash")
@@ -1410,6 +1439,89 @@ def _robustness_decision_summary(
         }
     )
 
+    cash_policy_rows = parameter_sweep[
+        parameter_sweep.get("VariantGroup", pd.Series(dtype=str)).isin(
+            ["DynamicCashTiming", "NoCashTiming", "CashTiming_ThresholdSweep"]
+        )
+        & (parameter_sweep.get("Status", "") == "OK")
+    ].copy()
+    if not cash_policy_rows.empty:
+        cash_policy_rows["Sharpe_Excess"] = pd.to_numeric(
+            cash_policy_rows["Sharpe_Excess"], errors="coerce"
+        )
+        cash_policy_rows = cash_policy_rows.dropna(subset=["Sharpe_Excess"])
+
+    baseline_row = _first_ok_row(parameter_sweep, "Label", "baseline")
+
+    def _best_variant_row(group: str) -> Optional[pd.Series]:
+        rows = parameter_sweep[
+            (parameter_sweep.get("VariantGroup", "") == group)
+            & (parameter_sweep.get("Status", "") == "OK")
+        ].copy()
+        if rows.empty:
+            return None
+        rows["Sharpe_Excess"] = pd.to_numeric(rows["Sharpe_Excess"], errors="coerce")
+        rows = rows.dropna(subset=["Sharpe_Excess"])
+        if rows.empty:
+            return None
+        return rows.loc[rows["Sharpe_Excess"].idxmax()]
+
+    best_cash_policy = (
+        cash_policy_rows.loc[cash_policy_rows["Sharpe_Excess"].idxmax()]
+        if not cash_policy_rows.empty
+        else None
+    )
+    best_no_cash = _best_variant_row("NoCashTiming")
+    best_threshold = _best_variant_row("CashTiming_ThresholdSweep")
+
+    def _variant_value(row: Optional[pd.Series], key: str) -> Optional[float]:
+        if row is None:
+            return None
+        return _metric_value(row.get(key))
+
+    dynamic_sharpe = _variant_value(baseline_row, "Sharpe_Excess")
+    dynamic_cagr = _variant_value(baseline_row, "CAGR")
+    dynamic_maxdd = _variant_value(baseline_row, "MaxDrawdown")
+    best_cash_sharpe = _variant_value(best_cash_policy, "Sharpe_Excess")
+    best_cash_cagr = _variant_value(best_cash_policy, "CAGR")
+    best_cash_maxdd = _variant_value(best_cash_policy, "MaxDrawdown")
+
+    summary.update(
+        {
+            "BestCashPolicyVariant": best_cash_policy.get("Label") if best_cash_policy is not None else None,
+            "BestCashPolicyGroup": best_cash_policy.get("VariantGroup") if best_cash_policy is not None else None,
+            "BestCashPolicy_Sharpe_Excess": best_cash_sharpe,
+            "BestCashPolicy_CAGR": best_cash_cagr,
+            "BestCashPolicy_MaxDrawdown": best_cash_maxdd,
+            "DynamicCashTiming_Sharpe_Excess": dynamic_sharpe,
+            "DynamicCashTiming_CAGR": dynamic_cagr,
+            "DynamicCashTiming_MaxDrawdown": dynamic_maxdd,
+            "DynamicCashTiming_Sharpe_Delta_vs_BestCashPolicy": (
+                dynamic_sharpe - best_cash_sharpe
+                if dynamic_sharpe is not None and best_cash_sharpe is not None
+                else None
+            ),
+            "DynamicCashTiming_CAGR_Delta_vs_BestCashPolicy": (
+                dynamic_cagr - best_cash_cagr
+                if dynamic_cagr is not None and best_cash_cagr is not None
+                else None
+            ),
+            "DynamicCashTiming_MaxDD_Reduction_vs_BestCashPolicy": (
+                best_cash_maxdd - dynamic_maxdd
+                if dynamic_maxdd is not None and best_cash_maxdd is not None
+                else None
+            ),
+            "BestNoCashTimingVariant": best_no_cash.get("Label") if best_no_cash is not None else None,
+            "BestNoCashTiming_Sharpe_Excess": _variant_value(best_no_cash, "Sharpe_Excess"),
+            "BestNoCashTiming_CAGR": _variant_value(best_no_cash, "CAGR"),
+            "BestNoCashTiming_MaxDrawdown": _variant_value(best_no_cash, "MaxDrawdown"),
+            "BestThresholdSweepVariant": best_threshold.get("Label") if best_threshold is not None else None,
+            "BestThresholdSweep_Sharpe_Excess": _variant_value(best_threshold, "Sharpe_Excess"),
+            "BestThresholdSweep_CAGR": _variant_value(best_threshold, "CAGR"),
+            "BestThresholdSweep_MaxDrawdown": _variant_value(best_threshold, "MaxDrawdown"),
+        }
+    )
+
     decision, reasons = _classify_strategy(summary)
     summary["Decision"] = decision
     summary["Reason"] = reasons
@@ -1471,6 +1583,18 @@ def _write_summary_markdown(outdir: Path, summary: Dict[str, object]) -> None:
         f"- Cash timing Sharpe contribution: {_fmt_metric(summary.get('CashTimingContribution_Sharpe_Excess'))}",
         f"- Exposure effect Sharpe contribution: {_fmt_metric(summary.get('ExposureEffect_Sharpe_Excess'))}",
         "",
+        "## Cash Policy Ablation",
+        "",
+        f"- Best cash policy variant: {summary.get('BestCashPolicyVariant')}",
+        f"- Best cash policy group: {summary.get('BestCashPolicyGroup')}",
+        f"- Best cash policy excess Sharpe: {_fmt_metric(summary.get('BestCashPolicy_Sharpe_Excess'))}",
+        f"- Best cash policy CAGR: {_fmt_metric(summary.get('BestCashPolicy_CAGR'), pct=True)}",
+        f"- Dynamic cash Sharpe delta: {_fmt_metric(summary.get('DynamicCashTiming_Sharpe_Delta_vs_BestCashPolicy'))}",
+        f"- Dynamic cash CAGR delta: {_fmt_metric(summary.get('DynamicCashTiming_CAGR_Delta_vs_BestCashPolicy'), pct=True)}",
+        f"- Dynamic cash max-DD reduction: {_fmt_metric(summary.get('DynamicCashTiming_MaxDD_Reduction_vs_BestCashPolicy'), pct=True)}",
+        f"- Best no-cash-timing variant: {summary.get('BestNoCashTimingVariant')}",
+        f"- Best threshold-sweep variant: {summary.get('BestThresholdSweepVariant')}",
+        "",
         "## Benchmarks",
         "",
         f"- Best by excess Sharpe: {summary.get('BestBenchmarkBySharpe')}",
@@ -1493,9 +1617,38 @@ def _write_summary_markdown(outdir: Path, summary: Dict[str, object]) -> None:
     (outdir / "robustness_summary.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def _robustness_variants(base_config: MatvmConfig) -> List[Tuple[str, MatvmConfig]]:
+def _robustness_variants(
+    base_config: MatvmConfig,
+    baseline_avg_cash_weight: Optional[float] = None,
+) -> List[Tuple[str, MatvmConfig]]:
+    avg_cash = 0.0 if baseline_avg_cash_weight is None else float(baseline_avg_cash_weight)
+    avg_cash = min(max(avg_cash, 0.0), 1.0)
     definitions: List[Tuple[str, Dict[str, object]]] = [
         ("baseline", {}),
+        (
+            "NoCashTiming_StaticAverageCash",
+            {"cash_policy": "fixed", "fixed_cash_weight": avg_cash},
+        ),
+        ("NoCashTiming_FixedCash_20", {"cash_policy": "fixed", "fixed_cash_weight": 0.20}),
+        ("NoCashTiming_FixedCash_30", {"cash_policy": "fixed", "fixed_cash_weight": 0.30}),
+        ("NoCashTiming_FixedCash_40", {"cash_policy": "fixed", "fixed_cash_weight": 0.40}),
+        ("NoCashTiming_FixedCash_50", {"cash_policy": "fixed", "fixed_cash_weight": 0.50}),
+        (
+            "CashTiming_ThresholdSweep_Tight",
+            {"dd_half": 0.04, "dd_safe": 0.08, "dd_exit": 0.03},
+        ),
+        (
+            "CashTiming_ThresholdSweep_Medium",
+            {"dd_half": 0.06, "dd_safe": 0.10, "dd_exit": 0.04},
+        ),
+        (
+            "CashTiming_ThresholdSweep_Loose",
+            {"dd_half": 0.10, "dd_safe": 0.16, "dd_exit": 0.08},
+        ),
+        (
+            "CashTiming_ThresholdSweep_VeryLoose",
+            {"dd_half": 0.12, "dd_safe": 0.20, "dd_exit": 0.10},
+        ),
         ("vol_window_40", {"vol_window": 40}),
         ("vol_window_90", {"vol_window": 90}),
         ("sma_window_150", {"sma_window": 150}),
@@ -1562,19 +1715,51 @@ def _precompute_variant_results(
     return out
 
 
+def _variant_group(name: str) -> str:
+    if name == "baseline":
+        return "DynamicCashTiming"
+    if name.startswith("NoCashTiming_"):
+        return "NoCashTiming"
+    if name.startswith("CashTiming_ThresholdSweep"):
+        return "CashTiming_ThresholdSweep"
+    return "ParameterSweep"
+
+
+def _variant_avg_cash_weight(res: BacktestResult, config: MatvmConfig) -> float:
+    if config.cash_ticker not in res.weights.columns or res.weights.empty:
+        return float("nan")
+    return float(res.weights[config.cash_ticker].mean())
+
+
 def _parameter_sweep_table(
     results: Dict[str, BacktestResult],
     daily_rf: pd.Series,
+    variant_configs: Dict[str, MatvmConfig],
 ) -> pd.DataFrame:
     rows = []
     for name, res in results.items():
+        cfg = variant_configs.get(name)
+        extra: Dict[str, object] = {"Trades": int(len(res.trades)), "VariantGroup": _variant_group(name)}
+        if cfg is not None:
+            avg_cash = _variant_avg_cash_weight(res, cfg)
+            extra.update(
+                {
+                    "CashPolicy": cfg.cash_policy,
+                    "FixedCashWeight": cfg.fixed_cash_weight,
+                    "AvgCashWeight": avg_cash,
+                    "AvgRiskWeight": 1.0 - avg_cash if not np.isnan(avg_cash) else np.nan,
+                    "DDHalf": cfg.dd_half,
+                    "DDSafe": cfg.dd_safe,
+                    "DDExit": cfg.dd_exit,
+                }
+            )
         row = _period_stats_row(
             label=name,
             requested_start=None,
             requested_end=None,
             equity=res.equity_curve,
             daily_rf=daily_rf,
-            extra={"Trades": int(len(res.trades))},
+            extra=extra,
         )
         rows.append(row)
     return pd.DataFrame(rows).sort_values("Sharpe_Excess", ascending=False, na_position="last")
@@ -2306,6 +2491,8 @@ def _allocation_diagnostic_tables(
 
 
 def _robustness_table_filename(name: str) -> str:
+    if name == "parameter_sweep":
+        return "robustness_parameter_variants.csv"
     if name in DIAGNOSTIC_OUTPUT_TABLES:
         return f"{name}.csv"
     return f"robustness_{name}.csv"
@@ -2462,7 +2649,9 @@ def run_robustness_analysis(
     daily_rf = _daily_rf_for_prices(prices, config)
 
     baseline = backtest(prices=prices, config=config, initial_capital=initial_capital)
-    variants = _robustness_variants(config)
+    baseline_avg_cash = _variant_avg_cash_weight(baseline, config)
+    variants = _robustness_variants(config, baseline_avg_cash_weight=baseline_avg_cash)
+    variant_configs = {name: cfg for name, cfg in variants}
     variant_results = _precompute_variant_results(
         prices=prices,
         variants=variants,
@@ -2479,6 +2668,7 @@ def run_robustness_analysis(
         "parameter_sweep": _parameter_sweep_table(
             results=variant_results,
             daily_rf=daily_rf,
+            variant_configs=variant_configs,
         ),
         "regimes": _regime_table(
             baseline=baseline,
@@ -3252,6 +3442,10 @@ def cli_robustness(args: argparse.Namespace) -> None:
     print(f"{'Same-cash DD reduction':>22}: {_fmt_metric(summary.get('SameCashSchedule_MaxDD_Reduction'), pct=True)}")
     print(f"{'Cash timing contrib':>22}: {_fmt_metric(summary.get('CashTimingContribution'), pct=True)}")
     print(f"{'Asset select contrib':>22}: {_fmt_metric(summary.get('AssetSelectionContribution'), pct=True)}")
+    print(f"{'Best cash policy':>22}: {summary.get('BestCashPolicyVariant')}")
+    print(f"{'Cash policy group':>22}: {summary.get('BestCashPolicyGroup')}")
+    print(f"{'Dyn cash Sharpe delta':>22}: {_fmt_metric(summary.get('DynamicCashTiming_Sharpe_Delta_vs_BestCashPolicy'))}")
+    print(f"{'Dyn cash CAGR delta':>22}: {_fmt_metric(summary.get('DynamicCashTiming_CAGR_Delta_vs_BestCashPolicy'), pct=True)}")
     print(f"{'WF negative folds':>22}: {summary.get('WalkForwardNegativeFoldCount')}")
     reasons = summary.get("Reason") or []
     if reasons:
@@ -3286,6 +3480,10 @@ def cli_robustness(args: argparse.Namespace) -> None:
 
     display_cols = [
         "Label",
+        "VariantGroup",
+        "CashPolicy",
+        "FixedCashWeight",
+        "AvgCashWeight",
         "Status",
         "ActualStart",
         "ActualEnd",
