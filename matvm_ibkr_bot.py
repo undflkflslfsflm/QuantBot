@@ -66,6 +66,11 @@ DIAGNOSTIC_OUTPUT_TABLES = {
     "return_contribution_by_asset",
     "best_allocation_decisions",
     "worst_allocation_decisions",
+    "signal_diagnostics",
+    "signal_ic_by_date",
+    "signal_ic_summary",
+    "signal_forward_return_buckets",
+    "signal_correlation_matrix",
 }
 
 
@@ -1295,6 +1300,10 @@ def _classify_strategy(summary: Dict[str, object]) -> Tuple[str, List[str]]:
     selected_dd_reduction = _metric_value(
         summary.get("SelectedCandidate_Drawdown_Reduction_vs_EqualWeightRisk")
     )
+    composite_mean_ic_4w = _metric_value(summary.get("CompositeScore_MeanIC_4W"))
+    composite_pos_ic_4w = _metric_value(summary.get("CompositeScore_PositiveICRate_4W"))
+    top_bottom_4w = _metric_value(summary.get("TopBucketMinusBottomBucket_4W"))
+    signal_decision = summary.get("SignalPredictiveDecision")
     candidate_mean_active_sharpe = _metric_value(
         summary.get("WalkForwardCandidateMeanActiveSharpe")
     )
@@ -1393,6 +1402,16 @@ def _classify_strategy(summary: Dict[str, object]) -> Tuple[str, List[str]]:
             reasons.append("Selected non-diagnostic candidate beats SameCashSchedule EqualWeightRisk on excess Sharpe")
         else:
             reasons.append("Selected non-diagnostic candidate loses to SameCashSchedule EqualWeightRisk on excess Sharpe")
+    if signal_decision:
+        reasons.append(f"Signal predictive decision is {signal_decision}")
+        if signal_decision in {"SIGNALS_WEAK_OR_NOISY", "INSUFFICIENT_DATA"}:
+            reasons.append("Ranking model lacks strong predictive evidence")
+    if composite_mean_ic_4w is not None:
+        reasons.append(f"CompositeScore 4W mean rank IC is {composite_mean_ic_4w:.3f}")
+    if composite_pos_ic_4w is not None:
+        reasons.append(f"CompositeScore 4W positive IC rate is {composite_pos_ic_4w:.1%}")
+    if top_bottom_4w is not None:
+        reasons.append(f"CompositeScore 4W top-minus-bottom return spread is {top_bottom_4w:.2%}")
     if candidate_mean_active_sharpe is not None:
         if candidate_mean_active_sharpe > 1e-6:
             reasons.append("Walk-forward candidate selection improves base on average test excess Sharpe")
@@ -1446,6 +1465,7 @@ def _robustness_decision_summary(
     metadata: Dict[str, object],
     effective_start: str,
     effective_end: str,
+    signal_summary: Optional[Dict[str, object]] = None,
 ) -> Dict[str, object]:
     active = tables["active_benchmarks"]
     benchmarks = tables["benchmarks"]
@@ -1533,6 +1553,8 @@ def _robustness_decision_summary(
             float(wf_candidate_active_cagr.mean()) if not wf_candidate_active_cagr.empty else None
         ),
     }
+    if signal_summary:
+        summary.update(signal_summary)
 
     if ew is not None:
         summary.update(
@@ -2089,6 +2111,14 @@ def _write_summary_markdown(outdir: Path, summary: Dict[str, object]) -> None:
         f"- Selected candidate excess-Sharpe percentile: {_fmt_metric(summary.get('SelectedCandidateRandomPercentile_Sharpe_Excess'), pct=True)}",
         f"- Random beat-base rate, excess Sharpe: {_fmt_metric(summary.get('RandomBeatBaseRate_Sharpe_Excess'), pct=True)}",
         f"- Base vs random median Calmar delta: {_fmt_metric(summary.get('BaseVsRandomMedian_Calmar_Delta'))}",
+        "",
+        "## Signal Predictive Diagnostics",
+        "",
+        f"- Signal predictive decision: {summary.get('SignalPredictiveDecision')}",
+        f"- Best signal by 4W mean IC: {summary.get('BestSignalByMeanIC_4W')}",
+        f"- CompositeScore 4W mean IC: {_fmt_metric(summary.get('CompositeScore_MeanIC_4W'))}",
+        f"- CompositeScore 4W positive IC rate: {_fmt_metric(summary.get('CompositeScore_PositiveICRate_4W'), pct=True)}",
+        f"- CompositeScore 4W top-minus-bottom spread: {_fmt_metric(summary.get('TopBucketMinusBottomBucket_4W'), pct=True)}",
         "",
         "## Benchmarks",
         "",
@@ -3101,6 +3131,469 @@ def _allocation_diagnostic_tables(
     }
 
 
+SIGNAL_FORWARD_HORIZONS: Tuple[Tuple[str, int], ...] = (
+    ("1W", 5),
+    ("4W", 20),
+    ("12W", 60),
+)
+
+
+def _forward_return_from_next_close(
+    prices: pd.DataFrame,
+    signal_date: pd.Timestamp,
+    ticker: str,
+    horizon_days: int,
+) -> float:
+    try:
+        pos = prices.index.get_loc(signal_date)
+    except KeyError:
+        return float("nan")
+    if not isinstance(pos, (int, np.integer)):
+        return float("nan")
+    start_pos = int(pos) + 1
+    end_pos = start_pos + int(horizon_days)
+    if start_pos >= len(prices.index) or end_pos >= len(prices.index):
+        return float("nan")
+    start_price = float(prices[ticker].iloc[start_pos])
+    end_price = float(prices[ticker].iloc[end_pos])
+    if start_price <= 0.0 or np.isnan(start_price) or np.isnan(end_price):
+        return float("nan")
+    return end_price / start_price - 1.0
+
+
+def _signal_values_for_date(
+    strategy: MatvmStrategy,
+    prices: pd.DataFrame,
+    config: MatvmConfig,
+    asof: pd.Timestamp,
+) -> Tuple[Dict[str, pd.Series], pd.Series]:
+    q, sigma, sma200 = strategy._compute_q_scores(prices, asof)
+    p0 = prices.loc[asof, config.risk_tickers]
+    trend_score = (p0 / sma200 - 1.0).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    raw_momentum = strategy._raw_momentum_scores(prices, asof)
+    rolling_peak = (
+        prices[config.risk_tickers]
+        .loc[:asof]
+        .tail(config.sma_window)
+        .max()
+        .replace(0.0, np.nan)
+    )
+    drawdown_score = (p0 / rolling_peak - 1.0).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    e_raw = ((q > 0.0) & (p0 > sma200)).astype(int)
+    e_hyst = strategy._update_hysteresis(e_raw)
+    cash_filter = e_hyst.reindex(config.risk_tickers).fillna(0.0)
+    base = strategy._asset_selection_weights(
+        prices=prices,
+        asof=asof,
+        q=q,
+        sigma=sigma,
+        trend=p0 > sma200,
+        e_hyst=e_hyst,
+    ).reindex(config.risk_tickers).fillna(0.0)
+    capped = strategy._cap_weights(base, cap=float(config.weight_cap)).reindex(config.risk_tickers).fillna(0.0)
+    composite = (q * cash_filter).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+    signal_values = {
+        "MomentumScore": raw_momentum.reindex(config.risk_tickers).fillna(0.0),
+        "VolatilityScore": (-sigma).reindex(config.risk_tickers).fillna(0.0),
+        "RiskAdjustedMomentumScore": q.reindex(config.risk_tickers).fillna(0.0),
+        "TrendScore": trend_score.reindex(config.risk_tickers).fillna(0.0),
+        "DrawdownScore": drawdown_score.reindex(config.risk_tickers).fillna(0.0),
+        "CashFilterScore": cash_filter,
+        "CompositeScore": composite,
+        "FinalSelectionScore": capped,
+    }
+    return signal_values, capped
+
+
+def _signal_diagnostics_table(
+    prices: pd.DataFrame,
+    config: MatvmConfig,
+    baseline: BacktestResult,
+) -> pd.DataFrame:
+    prices = _ensure_datetime_index(prices).sort_index()
+    signal_dates = pd.DatetimeIndex(
+        prices.index.to_series().resample(config.rebalance_freq).last().dropna().values
+    )
+    signal_dates = signal_dates.intersection(prices.index)
+    weights = baseline.weights.reindex(prices.index).ffill().fillna(0.0)
+    strategy = MatvmStrategy(config=config)
+    rows: List[Dict[str, object]] = []
+
+    for signal_date in signal_dates:
+        try:
+            pos = prices.index.get_loc(signal_date)
+        except KeyError:
+            continue
+        if not isinstance(pos, (int, np.integer)) or int(pos) + 1 >= len(prices.index):
+            continue
+        if len(prices.loc[:signal_date]) < config.required_history_days():
+            continue
+
+        try:
+            signal_values, final_scores = _signal_values_for_date(
+                strategy=strategy,
+                prices=prices,
+                config=config,
+                asof=signal_date,
+            )
+        except Exception:
+            continue
+
+        trade_date = prices.index[int(pos) + 1]
+        if trade_date in weights.index:
+            trade_weights = weights.loc[trade_date]
+            cash_weight = float(trade_weights.get(config.cash_ticker, 1.0))
+            risk_weight = float(trade_weights.reindex(config.risk_tickers).fillna(0.0).sum())
+        else:
+            cash_weight = float("nan")
+            risk_weight = float("nan")
+
+        forward_returns = {
+            ticker: {
+                horizon: _forward_return_from_next_close(
+                    prices=prices,
+                    signal_date=signal_date,
+                    ticker=ticker,
+                    horizon_days=days,
+                )
+                for horizon, days in SIGNAL_FORWARD_HORIZONS
+            }
+            for ticker in config.risk_tickers
+        }
+
+        for signal_name, values in signal_values.items():
+            ranks = values.rank(ascending=False, method="average")
+            for ticker in config.risk_tickers:
+                rows.append(
+                    {
+                        "Date": signal_date,
+                        "Ticker": ticker,
+                        "SignalName": signal_name,
+                        "SignalValue": float(values.get(ticker, np.nan)),
+                        "Rank": float(ranks.get(ticker, np.nan)),
+                        "ForwardReturn_1W": forward_returns[ticker]["1W"],
+                        "ForwardReturn_4W": forward_returns[ticker]["4W"],
+                        "ForwardReturn_12W": forward_returns[ticker]["12W"],
+                        "WasSelected": bool(float(final_scores.get(ticker, 0.0)) > 1e-9),
+                        "CashWeight": cash_weight,
+                        "RiskWeight": risk_weight,
+                    }
+                )
+
+    columns = [
+        "Date",
+        "Ticker",
+        "SignalName",
+        "SignalValue",
+        "Rank",
+        "ForwardReturn_1W",
+        "ForwardReturn_4W",
+        "ForwardReturn_12W",
+        "WasSelected",
+        "CashWeight",
+        "RiskWeight",
+    ]
+    return pd.DataFrame(rows, columns=columns)
+
+
+def _rank_ic_by_date_table(signal_diagnostics: pd.DataFrame) -> pd.DataFrame:
+    rows: List[Dict[str, object]] = []
+    if signal_diagnostics.empty:
+        return pd.DataFrame(columns=["Date", "SignalName", "Horizon", "RankIC", "AssetCount"])
+
+    for (date, signal_name), group in signal_diagnostics.groupby(["Date", "SignalName"]):
+        for horizon, _days in SIGNAL_FORWARD_HORIZONS:
+            ret_col = f"ForwardReturn_{horizon}"
+            subset = group[["SignalValue", ret_col]].dropna()
+            asset_count = int(len(subset))
+            if asset_count < 3 or subset["SignalValue"].nunique() < 2 or subset[ret_col].nunique() < 2:
+                rank_ic = float("nan")
+            else:
+                signal_rank = subset["SignalValue"].rank(method="average")
+                return_rank = subset[ret_col].rank(method="average")
+                rank_ic = float(signal_rank.corr(return_rank))
+            rows.append(
+                {
+                    "Date": date,
+                    "SignalName": signal_name,
+                    "Horizon": horizon,
+                    "RankIC": rank_ic,
+                    "AssetCount": asset_count,
+                }
+            )
+
+    return pd.DataFrame(rows, columns=["Date", "SignalName", "Horizon", "RankIC", "AssetCount"])
+
+
+def _signal_ic_summary_table(signal_ic_by_date: pd.DataFrame) -> pd.DataFrame:
+    columns = [
+        "SignalName",
+        "Horizon",
+        "MeanRankIC",
+        "MedianRankIC",
+        "StdRankIC",
+        "IC_TStat",
+        "PositiveICRate",
+        "ObservationCount",
+    ]
+    if signal_ic_by_date.empty:
+        return pd.DataFrame(columns=columns)
+
+    rows: List[Dict[str, object]] = []
+    for (signal_name, horizon), group in signal_ic_by_date.groupby(["SignalName", "Horizon"]):
+        values = pd.to_numeric(group["RankIC"], errors="coerce").dropna()
+        count = int(len(values))
+        mean_ic = float(values.mean()) if count else np.nan
+        std_ic = float(values.std(ddof=1)) if count > 1 else np.nan
+        t_stat = mean_ic / (std_ic / math.sqrt(count)) if count > 1 and std_ic > 0 else np.nan
+        rows.append(
+            {
+                "SignalName": signal_name,
+                "Horizon": horizon,
+                "MeanRankIC": mean_ic,
+                "MedianRankIC": float(values.median()) if count else np.nan,
+                "StdRankIC": std_ic,
+                "IC_TStat": float(t_stat) if not np.isnan(t_stat) else np.nan,
+                "PositiveICRate": float((values > 0.0).mean()) if count else np.nan,
+                "ObservationCount": count,
+            }
+        )
+
+    return pd.DataFrame(rows, columns=columns)
+
+
+def _signal_bucket_label(bucket_idx: int, bucket_count: int) -> str:
+    if bucket_count <= 1:
+        return "All"
+    if bucket_count == 2:
+        return "Top" if bucket_idx == 0 else "Bottom"
+    if bucket_idx == 0:
+        return "Top"
+    if bucket_idx == bucket_count - 1:
+        return "Bottom"
+    return "Middle"
+
+
+def _signal_forward_return_buckets_table(signal_diagnostics: pd.DataFrame) -> pd.DataFrame:
+    columns = [
+        "SignalName",
+        "Horizon",
+        "Bucket",
+        "MeanForwardReturn",
+        "MedianForwardReturn",
+        "ObservationCount",
+        "HitRatePositive",
+        "AvgRank",
+    ]
+    if signal_diagnostics.empty:
+        return pd.DataFrame(columns=columns)
+
+    bucket_rows: List[Dict[str, object]] = []
+    for (date, signal_name), group in signal_diagnostics.groupby(["Date", "SignalName"]):
+        group = group.dropna(subset=["SignalValue"]).sort_values("SignalValue", ascending=False).copy()
+        n = len(group)
+        if n < 2:
+            continue
+        bucket_count = 3 if n >= 3 else 2
+        for rank_pos, idx in enumerate(group.index):
+            bucket_idx = int(math.floor(rank_pos * bucket_count / n))
+            bucket_idx = min(max(bucket_idx, 0), bucket_count - 1)
+            for horizon, _days in SIGNAL_FORWARD_HORIZONS:
+                ret_col = f"ForwardReturn_{horizon}"
+                forward_return = group.at[idx, ret_col]
+                if pd.isna(forward_return):
+                    continue
+                bucket_rows.append(
+                    {
+                        "SignalName": signal_name,
+                        "Horizon": horizon,
+                        "Bucket": _signal_bucket_label(bucket_idx, bucket_count),
+                        "ForwardReturn": float(forward_return),
+                        "Rank": float(group.at[idx, "Rank"]),
+                    }
+                )
+
+    if not bucket_rows:
+        return pd.DataFrame(columns=columns)
+
+    bucket_df = pd.DataFrame(bucket_rows)
+    rows: List[Dict[str, object]] = []
+    for (signal_name, horizon, bucket), group in bucket_df.groupby(["SignalName", "Horizon", "Bucket"]):
+        returns = pd.to_numeric(group["ForwardReturn"], errors="coerce").dropna()
+        rows.append(
+            {
+                "SignalName": signal_name,
+                "Horizon": horizon,
+                "Bucket": bucket,
+                "MeanForwardReturn": float(returns.mean()) if len(returns) else np.nan,
+                "MedianForwardReturn": float(returns.median()) if len(returns) else np.nan,
+                "ObservationCount": int(len(returns)),
+                "HitRatePositive": float((returns > 0.0).mean()) if len(returns) else np.nan,
+                "AvgRank": float(group["Rank"].mean()),
+            }
+        )
+
+    return pd.DataFrame(rows, columns=columns)
+
+
+def _signal_correlation_matrix(signal_diagnostics: pd.DataFrame) -> pd.DataFrame:
+    if signal_diagnostics.empty:
+        return pd.DataFrame()
+    pivot = signal_diagnostics.pivot_table(
+        index=["Date", "Ticker"],
+        columns="SignalName",
+        values="SignalValue",
+        aggfunc="first",
+    )
+    corr = pivot.corr()
+    return corr.reset_index().rename(columns={"index": "SignalName"})
+
+
+def _signal_top_bottom_spread(
+    buckets: pd.DataFrame,
+    signal_name: str,
+    horizon: str,
+) -> Optional[float]:
+    if buckets.empty:
+        return None
+    rows = buckets[
+        (buckets["SignalName"] == signal_name)
+        & (buckets["Horizon"] == horizon)
+    ]
+    if rows.empty:
+        return None
+    top = rows[rows["Bucket"] == "Top"]
+    bottom = rows[rows["Bucket"] == "Bottom"]
+    if top.empty or bottom.empty:
+        return None
+    top_mean = _metric_value(top.iloc[0].get("MeanForwardReturn"))
+    bottom_mean = _metric_value(bottom.iloc[0].get("MeanForwardReturn"))
+    if top_mean is None or bottom_mean is None:
+        return None
+    return top_mean - bottom_mean
+
+
+def _signal_predictive_summary(
+    ic_summary: pd.DataFrame,
+    buckets: pd.DataFrame,
+) -> Dict[str, object]:
+    summary: Dict[str, object] = {}
+
+    for horizon, _days in SIGNAL_FORWARD_HORIZONS:
+        rows = ic_summary[ic_summary.get("Horizon", "") == horizon].copy()
+        if not rows.empty:
+            rows["MeanRankIC"] = pd.to_numeric(rows["MeanRankIC"], errors="coerce")
+            rows = rows.dropna(subset=["MeanRankIC"])
+        best_signal = None
+        if not rows.empty:
+            best_signal = str(rows.loc[rows["MeanRankIC"].idxmax()].get("SignalName"))
+        comp = rows[rows["SignalName"] == "CompositeScore"] if not rows.empty else pd.DataFrame()
+        comp_mean = _metric_value(comp.iloc[0].get("MeanRankIC")) if not comp.empty else None
+        comp_pos = _metric_value(comp.iloc[0].get("PositiveICRate")) if not comp.empty else None
+        spread = _signal_top_bottom_spread(buckets, "CompositeScore", horizon)
+        summary[f"BestSignalByMeanIC_{horizon}"] = best_signal
+        summary[f"CompositeScore_MeanIC_{horizon}"] = comp_mean
+        summary[f"CompositeScore_PositiveICRate_{horizon}"] = comp_pos
+        summary[f"TopBucketMinusBottomBucket_{horizon}"] = spread
+
+    def _passes(signal_name: str) -> bool:
+        checks = []
+        for horizon in ("4W", "12W"):
+            rows = ic_summary[
+                (ic_summary.get("SignalName", "") == signal_name)
+                & (ic_summary.get("Horizon", "") == horizon)
+            ]
+            if rows.empty:
+                return False
+            mean_ic = _metric_value(rows.iloc[0].get("MeanRankIC"))
+            pos_rate = _metric_value(rows.iloc[0].get("PositiveICRate"))
+            spread = _signal_top_bottom_spread(buckets, signal_name, horizon)
+            checks.append(
+                mean_ic is not None
+                and mean_ic > 0.0
+                and pos_rate is not None
+                and pos_rate >= 0.55
+                and spread is not None
+                and spread > 0.0
+            )
+        return all(checks)
+
+    if ic_summary.empty:
+        decision = "INSUFFICIENT_DATA"
+    elif _passes("CompositeScore"):
+        decision = "SIGNALS_HAVE_PREDICTIVE_VALUE"
+    else:
+        component_signals = [
+            signal
+            for signal in ic_summary["SignalName"].dropna().unique().tolist()
+            if signal not in {"CompositeScore", "FinalSelectionScore"}
+        ]
+        if any(_passes(str(signal)) for signal in component_signals):
+            decision = "COMPOSITE_WEAK_BUT_COMPONENTS_USEFUL"
+        else:
+            all_ics = pd.to_numeric(ic_summary["MeanRankIC"], errors="coerce").dropna()
+            if not all_ics.empty and float((all_ics <= 0.02).mean()) >= 0.60:
+                decision = "SIGNALS_WEAK_OR_NOISY"
+            else:
+                decision = "INSUFFICIENT_DATA"
+
+    summary["SignalPredictiveDecision"] = decision
+    return {str(k): _json_value(v) for k, v in summary.items()}
+
+
+def _signal_diagnostic_tables(
+    prices: pd.DataFrame,
+    config: MatvmConfig,
+    baseline: BacktestResult,
+) -> Tuple[Dict[str, pd.DataFrame], Dict[str, object]]:
+    diagnostics = _signal_diagnostics_table(prices=prices, config=config, baseline=baseline)
+    ic_by_date = _rank_ic_by_date_table(diagnostics)
+    ic_summary = _signal_ic_summary_table(ic_by_date)
+    buckets = _signal_forward_return_buckets_table(diagnostics)
+    corr = _signal_correlation_matrix(diagnostics)
+    predictive_summary = _signal_predictive_summary(ic_summary=ic_summary, buckets=buckets)
+    return (
+        {
+            "signal_diagnostics": diagnostics,
+            "signal_ic_by_date": ic_by_date,
+            "signal_ic_summary": ic_summary,
+            "signal_forward_return_buckets": buckets,
+            "signal_correlation_matrix": corr,
+        },
+        predictive_summary,
+    )
+
+
+def _write_signal_predictive_summary_markdown(
+    outdir: Path,
+    summary: Dict[str, object],
+) -> None:
+    lines = [
+        "# Signal Predictive Summary",
+        "",
+        f"Decision: {summary.get('SignalPredictiveDecision')}",
+        "",
+        "## Composite Score",
+        "",
+        f"- Mean IC 1W: {_fmt_metric(summary.get('CompositeScore_MeanIC_1W'))}",
+        f"- Mean IC 4W: {_fmt_metric(summary.get('CompositeScore_MeanIC_4W'))}",
+        f"- Mean IC 12W: {_fmt_metric(summary.get('CompositeScore_MeanIC_12W'))}",
+        f"- Positive IC rate 4W: {_fmt_metric(summary.get('CompositeScore_PositiveICRate_4W'), pct=True)}",
+        f"- Top-minus-bottom 4W: {_fmt_metric(summary.get('TopBucketMinusBottomBucket_4W'), pct=True)}",
+        "",
+        "## Best Signals",
+        "",
+        f"- 1W: {summary.get('BestSignalByMeanIC_1W')}",
+        f"- 4W: {summary.get('BestSignalByMeanIC_4W')}",
+        f"- 12W: {summary.get('BestSignalByMeanIC_12W')}",
+    ]
+    (outdir / "signal_predictive_summary.md").write_text(
+        "\n".join(lines) + "\n",
+        encoding="utf-8",
+    )
+
+
 def _robustness_table_filename(name: str) -> str:
     if name == "parameter_sweep":
         return "robustness_parameter_variants.csv"
@@ -3548,6 +4041,11 @@ def run_robustness_analysis(
         variants=variants,
         initial_capital=initial_capital,
     )
+    signal_tables, signal_summary = _signal_diagnostic_tables(
+        prices=prices,
+        config=config,
+        baseline=baseline,
+    )
 
     tables = {
         "start_dates": _start_date_sensitivity(
@@ -3599,6 +4097,7 @@ def run_robustness_analysis(
             score_metric=score_metric,
         ),
     }
+    tables.update(signal_tables)
     tables.update(
         _allocation_diagnostic_tables(
             baseline=baseline,
@@ -3621,6 +4120,7 @@ def run_robustness_analysis(
         metadata=metadata,
         effective_start=str(prices.index[0].date()),
         effective_end=str(prices.index[-1].date()),
+        signal_summary=signal_summary,
     )
     tables = {name: _add_run_metadata(df, metadata) for name, df in tables.items()}
 
@@ -3640,12 +4140,18 @@ def run_robustness_analysis(
         "score_metric": score_metric,
         "tables": {name: _robustness_table_filename(name) for name in tables},
         "plots": plot_files,
+        "signal_predictive_summary": "signal_predictive_summary.json",
     }
     summary.update(decision_summary)
     (outdir / "robustness_summary.json").write_text(
         json.dumps(_json_value(summary), indent=2, sort_keys=True),
         encoding="utf-8",
     )
+    (outdir / "signal_predictive_summary.json").write_text(
+        json.dumps(_json_value(signal_summary), indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    _write_signal_predictive_summary_markdown(outdir, signal_summary)
     _write_summary_markdown(outdir, decision_summary)
     return tables
 
@@ -4364,6 +4870,11 @@ def cli_robustness(args: argparse.Namespace) -> None:
     print(f"{'Random null seeds':>22}: {summary.get('RandomNullSeedCount')}")
     print(f"{'Base random pctile':>22}: {_fmt_metric(summary.get('BaseRandomPercentile_Sharpe_Excess'), pct=True)}")
     print(f"{'Random beat base':>22}: {_fmt_metric(summary.get('RandomBeatBaseRate_Sharpe_Excess'), pct=True)}")
+    print(f"{'Signal decision':>22}: {summary.get('SignalPredictiveDecision')}")
+    print(f"{'Best signal 4W':>22}: {summary.get('BestSignalByMeanIC_4W')}")
+    print(f"{'Composite IC 4W':>22}: {_fmt_metric(summary.get('CompositeScore_MeanIC_4W'))}")
+    print(f"{'Composite +IC 4W':>22}: {_fmt_metric(summary.get('CompositeScore_PositiveICRate_4W'), pct=True)}")
+    print(f"{'Top-bottom 4W':>22}: {_fmt_metric(summary.get('TopBucketMinusBottomBucket_4W'), pct=True)}")
     print(f"{'WF negative folds':>22}: {summary.get('WalkForwardNegativeFoldCount')}")
     print(f"{'WF cand neg folds':>22}: {summary.get('WalkForwardCandidateNegativeFoldCount')}")
     print(f"{'WF cand mean Sharpe':>22}: {_fmt_metric(summary.get('WalkForwardCandidateMeanSharpe'))}")
