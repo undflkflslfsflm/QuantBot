@@ -32,12 +32,32 @@ TRADING_DAYS_PER_YEAR = 252
 RISK_FREE_MODES = {"zero", "constant", "ticker"}
 CASH_RETURN_MODES = {"zero", "constant", "ticker"}
 CASH_POLICY_MODES = {"dynamic", "fixed"}
+ASSET_SELECTION_MODES = {
+    "base",
+    "equal_weight_selected",
+    "top_momentum_only",
+    "top_momentum_no_vol_filter",
+    "min_vol_only",
+    "risk_parity_selected",
+    "random_selected",
+}
 MIN_DAILY_RETURN_STD = 1e-5
 DECISION_MIN_EXCESS_SHARPE = 0.50
 DECISION_MATERIAL_DD_REDUCTION = 0.08
 VOL_TARGET_BENCHMARKS = (0.08, 0.10, 0.12)
 VOL_TARGET_LOOKBACK_DAYS = 63
 EXPOSURE_MATCHED_PREFIXES = ("StaticMatched_", "SameCashSchedule_")
+WALK_FORWARD_CANDIDATE_VARIANTS = (
+    "baseline",
+    "CashTiming_ThresholdSweep_Loose",
+    "NoCashTiming_StaticAverageCash",
+    "NoCashTiming_FixedCash_30",
+    "NoCashTiming_FixedCash_40",
+    "AssetSelection_EqualWeightSelected",
+    "AssetSelection_TopMomentumOnly",
+    "AssetSelection_MinVolOnly",
+    "AssetSelection_RiskParitySelected",
+)
 DIAGNOSTIC_OUTPUT_TABLES = {
     "allocation_history",
     "asset_weight_summary",
@@ -191,6 +211,8 @@ class MatvmConfig:
     vol_target: float = 0.08  # annualized
     cash_policy: str = "dynamic"  # "dynamic" or "fixed"; research variants only
     fixed_cash_weight: Optional[float] = None
+    asset_selection_mode: str = "base"
+    asset_selection_seed: Optional[int] = None
 
     # Capital preservation overlay (drawdown thresholds)
     dd_half: float = 0.08
@@ -306,6 +328,20 @@ class MatvmStrategy:
         e_raw = e_raw.astype(int)
         return e_raw, sigma, sma200
 
+    def _raw_momentum_scores(self, prices: pd.DataFrame, asof: pd.Timestamp) -> pd.Series:
+        """Momentum scores without volatility normalization."""
+        risk = prices[self.cfg.risk_tickers].loc[:asof]
+        if len(risk) < max(self.cfg.momentum_windows):
+            return pd.Series(0.0, index=self.cfg.risk_tickers, dtype=float)
+
+        p0 = risk.iloc[-1]
+        parts = []
+        for lookback in self.cfg.momentum_windows:
+            pL = risk.iloc[-lookback]
+            parts.append(np.log(p0 / pL))
+        raw = pd.concat(parts, axis=1).mean(axis=1)
+        return raw.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
     def _update_hysteresis(self, e_raw: pd.Series) -> pd.Series:
         """Update held status using confirm_signals hysteresis and return E_hyst."""
         confirm = self.cfg.confirm_signals
@@ -416,6 +452,74 @@ class MatvmStrategy:
         var = max(var, 0.0)
         return float(math.sqrt(TRADING_DAYS_PER_YEAR * var))
 
+    def _asset_selection_weights(
+        self,
+        prices: pd.DataFrame,
+        asof: pd.Timestamp,
+        q: pd.Series,
+        sigma: pd.Series,
+        trend: pd.Series,
+        e_hyst: pd.Series,
+    ) -> pd.Series:
+        mode = str(self.cfg.asset_selection_mode).strip().lower()
+        if mode not in ASSET_SELECTION_MODES:
+            raise ValueError(f"Unknown asset_selection_mode: {self.cfg.asset_selection_mode}")
+
+        weights = pd.Series(0.0, index=self.cfg.risk_tickers, dtype=float)
+
+        if mode == "top_momentum_no_vol_filter":
+            raw_momentum = self._raw_momentum_scores(prices, asof)
+            active = [
+                ticker
+                for ticker in self.cfg.risk_tickers
+                if bool(trend.get(ticker, False)) and float(raw_momentum.get(ticker, 0.0)) > 0.0
+            ]
+            if not active:
+                return weights
+            chosen = max(active, key=lambda ticker: float(raw_momentum.get(ticker, -np.inf)))
+            weights[chosen] = 1.0
+            return weights
+
+        active = [
+            ticker
+            for ticker in self.cfg.risk_tickers
+            if float(e_hyst.get(ticker, 0.0)) > 0.0
+        ]
+        if not active:
+            return weights
+
+        if mode == "equal_weight_selected":
+            for ticker in active:
+                weights[ticker] = 1.0 / len(active)
+            return weights
+
+        if mode == "top_momentum_only":
+            chosen = max(active, key=lambda ticker: float(q.get(ticker, -np.inf)))
+            weights[chosen] = 1.0
+            return weights
+
+        if mode == "min_vol_only":
+            chosen = min(active, key=lambda ticker: float(sigma.get(ticker, np.inf)))
+            weights[chosen] = 1.0
+            return weights
+
+        if mode == "random_selected":
+            seed = 0 if self.cfg.asset_selection_seed is None else int(self.cfg.asset_selection_seed)
+            day_key = int(pd.Timestamp(asof).strftime("%Y%m%d"))
+            rng = np.random.default_rng(seed * 1_000_003 + day_key)
+            chosen = str(rng.choice(active))
+            weights[chosen] = 1.0
+            return weights
+
+        inv = pd.Series(0.0, index=self.cfg.risk_tickers, dtype=float)
+        for ticker in active:
+            vol = float(sigma.get(ticker, 0.0))
+            inv[ticker] = 0.0 if vol <= 0 else 1.0 / vol
+
+        if inv.sum() <= 0:
+            return weights
+        return inv / inv.sum()
+
     def _risk_multiplier(self, dd: float, breadth_good: bool) -> float:
         """Drawdown-based k with safe-mode latch + ramp-out."""
         dd = float(dd)
@@ -470,7 +574,10 @@ class MatvmStrategy:
             return w
 
         # Raw eligibility and vol
-        e_raw, sigma, _sma200 = self._raw_eligibility(prices, asof)
+        q, sigma, sma200 = self._compute_q_scores(prices, asof)
+        p0 = prices.loc[asof, self.cfg.risk_tickers]
+        trend = p0 > sma200
+        e_raw = ((q > 0.0) & trend).astype(int)
 
         breadth_good = int(e_raw.sum()) >= int(self.cfg.breadth_min)
         if breadth_good:
@@ -481,17 +588,14 @@ class MatvmStrategy:
         # Apply hysteresis to get E_hyst
         e_hyst = self._update_hysteresis(e_raw)
 
-        # Base inverse-vol weights
-        inv = pd.Series(0.0, index=self.cfg.risk_tickers, dtype=float)
-        for a in self.cfg.risk_tickers:
-            if e_hyst.get(a, 0.0) > 0.0:
-                s = float(sigma.get(a, 0.0))
-                inv[a] = 0.0 if s <= 0 else 1.0 / s
-
-        if inv.sum() <= 0:
-            base = pd.Series(0.0, index=self.cfg.risk_tickers, dtype=float)
-        else:
-            base = inv / inv.sum()
+        base = self._asset_selection_weights(
+            prices=prices,
+            asof=asof,
+            q=q,
+            sigma=sigma,
+            trend=trend,
+            e_hyst=e_hyst,
+        )
 
         # Cap concentration; leftover becomes cash
         capped = self._cap_weights(base, cap=float(self.cfg.weight_cap))
@@ -1152,6 +1256,7 @@ def _classify_strategy(summary: Dict[str, object]) -> Tuple[str, List[str]]:
 
     worst_wf = _metric_value(summary.get("WalkForwardWorstSharpe"))
     negative_folds = int(summary.get("WalkForwardNegativeFoldCount") or 0)
+    candidate_negative_folds = int(summary.get("WalkForwardCandidateNegativeFoldCount") or 0)
     strategy_sharpe = _metric_value(summary.get("Strategy_Sharpe_Excess"))
     ew_sharpe_delta = _metric_value(summary.get("EqualWeightRisk_Sharpe_Delta"))
     ew_dd_reduction = _metric_value(summary.get("EqualWeightRisk_Drawdown_Reduction"))
@@ -1163,10 +1268,23 @@ def _classify_strategy(summary: Dict[str, object]) -> Tuple[str, List[str]]:
     dynamic_cash_policy_delta = _metric_value(
         summary.get("DynamicCashTiming_Sharpe_Delta_vs_BestCashPolicy")
     )
+    base_vs_eq_selected = _metric_value(
+        summary.get("BaseVsEqualWeightSelected_Sharpe_Excess_Delta")
+    )
+    base_vs_top_momentum = _metric_value(summary.get("BaseVsTopMomentum_Sharpe_Excess_Delta"))
+    base_vs_min_vol = _metric_value(summary.get("BaseVsMinVol_Sharpe_Excess_Delta"))
+    base_vs_random_median = _metric_value(
+        summary.get("BaseVsRandomMedian_Sharpe_Excess_Delta")
+    )
+    candidate_mean_active_sharpe = _metric_value(
+        summary.get("WalkForwardCandidateMeanActiveSharpe")
+    )
     best_cash_policy = summary.get("BestCashPolicyVariant")
 
     if negative_folds > 0:
         reasons.append("At least one walk-forward fold has negative excess Sharpe")
+    if candidate_negative_folds > 0:
+        reasons.append("At least one walk-forward candidate-selection fold has negative excess Sharpe")
     if worst_wf is not None:
         reasons.append(f"Worst walk-forward excess Sharpe is {worst_wf:.3f}")
     if strategy_sharpe is None or strategy_sharpe < DECISION_MIN_EXCESS_SHARPE:
@@ -1211,6 +1329,33 @@ def _classify_strategy(summary: Dict[str, object]) -> Tuple[str, List[str]]:
             )
         else:
             reasons.append(f"Dynamic cash timing is tied with best cash policy: {best_cash_policy}")
+    if base_vs_eq_selected is not None:
+        if base_vs_eq_selected >= 0:
+            reasons.append("MATVM base selection beats equal-weight selected assets on excess Sharpe")
+        else:
+            reasons.append("MATVM base selection loses to equal-weight selected assets on excess Sharpe")
+    if base_vs_top_momentum is not None:
+        if base_vs_top_momentum >= 0:
+            reasons.append("MATVM base selection beats top-momentum-only selection on excess Sharpe")
+        else:
+            reasons.append("MATVM base selection loses to top-momentum-only selection on excess Sharpe")
+    if base_vs_min_vol is not None:
+        if base_vs_min_vol >= 0:
+            reasons.append("MATVM base selection beats min-vol-only selection on excess Sharpe")
+        else:
+            reasons.append("MATVM base selection loses to min-vol-only selection on excess Sharpe")
+    if base_vs_random_median is not None:
+        if base_vs_random_median >= 0:
+            reasons.append("MATVM base selection beats median random same-cash selection on excess Sharpe")
+        else:
+            reasons.append("MATVM base selection loses to median random same-cash selection on excess Sharpe")
+    if candidate_mean_active_sharpe is not None:
+        if candidate_mean_active_sharpe > 1e-6:
+            reasons.append("Walk-forward candidate selection improves base on average test excess Sharpe")
+        elif candidate_mean_active_sharpe < -1e-6:
+            reasons.append("Walk-forward candidate selection worsens base on average test excess Sharpe")
+        else:
+            reasons.append("Walk-forward candidate selection is tied with base on average test excess Sharpe")
 
     if (
         strategy_sharpe is not None
@@ -1222,6 +1367,9 @@ def _classify_strategy(summary: Dict[str, object]) -> Tuple[str, List[str]]:
         and same_cash_sharpe_delta is not None
         and same_cash_sharpe_delta >= 0
         and negative_folds == 0
+        and candidate_negative_folds == 0
+        and base_vs_random_median is not None
+        and base_vs_random_median >= 0
     ):
         return "PASS_DEFENSIVE_CANDIDATE", reasons
 
@@ -1249,6 +1397,7 @@ def _robustness_decision_summary(
     active = tables["active_benchmarks"]
     benchmarks = tables["benchmarks"]
     walk_forward = tables["walk_forward"]
+    walkforward_candidate = tables.get("walkforward_candidate_selection", pd.DataFrame())
     parameter_sweep = tables["parameter_sweep"]
 
     ew = _first_ok_row(active, "Benchmark", "EqualWeightRisk")
@@ -1258,6 +1407,26 @@ def _robustness_decision_summary(
         pd.to_numeric(walk_forward["Sharpe_Excess"], errors="coerce").dropna()
         if "Sharpe_Excess" in walk_forward.columns
         else pd.Series(dtype=float)
+    )
+    wf_candidate_sharpe = (
+        pd.to_numeric(walkforward_candidate["Test_Sharpe_Excess"], errors="coerce").dropna()
+        if "Test_Sharpe_Excess" in walkforward_candidate.columns
+        else pd.Series(dtype=float)
+    )
+    wf_candidate_active_sharpe = (
+        pd.to_numeric(walkforward_candidate["Test_Active_Sharpe_Excess"], errors="coerce").dropna()
+        if "Test_Active_Sharpe_Excess" in walkforward_candidate.columns
+        else pd.Series(dtype=float)
+    )
+    wf_candidate_active_cagr = (
+        pd.to_numeric(walkforward_candidate["Test_Active_CAGR"], errors="coerce").dropna()
+        if "Test_Active_CAGR" in walkforward_candidate.columns
+        else pd.Series(dtype=float)
+    )
+    wf_candidate_counts = (
+        walkforward_candidate["SelectedVariant"].astype(str).value_counts().to_dict()
+        if "SelectedVariant" in walkforward_candidate.columns
+        else {}
     )
 
     summary: Dict[str, object] = {
@@ -1283,6 +1452,32 @@ def _robustness_decision_summary(
         "BestBenchmarkByDrawdown": _best_benchmark(benchmarks, "MaxDrawdown", "min"),
         "WalkForwardWorstSharpe": float(wf_sharpe.min()) if not wf_sharpe.empty else None,
         "WalkForwardNegativeFoldCount": int((wf_sharpe < 0).sum()) if not wf_sharpe.empty else 0,
+        "WalkForwardSelectedVariantCounts": wf_candidate_counts,
+        "WalkForwardCandidateWorstSharpe": (
+            float(wf_candidate_sharpe.min()) if not wf_candidate_sharpe.empty else None
+        ),
+        "WalkForwardCandidateNegativeFoldCount": (
+            int((wf_candidate_sharpe < 0).sum()) if not wf_candidate_sharpe.empty else 0
+        ),
+        "WalkForwardCandidateMedianSharpe": (
+            float(wf_candidate_sharpe.median()) if not wf_candidate_sharpe.empty else None
+        ),
+        "WalkForwardCandidateMeanSharpe": (
+            float(wf_candidate_sharpe.mean()) if not wf_candidate_sharpe.empty else None
+        ),
+        "WalkForwardCandidateMedianActiveSharpe": (
+            float(wf_candidate_active_sharpe.median())
+            if not wf_candidate_active_sharpe.empty
+            else None
+        ),
+        "WalkForwardCandidateMeanActiveSharpe": (
+            float(wf_candidate_active_sharpe.mean())
+            if not wf_candidate_active_sharpe.empty
+            else None
+        ),
+        "WalkForwardCandidateMeanActiveCAGR": (
+            float(wf_candidate_active_cagr.mean()) if not wf_candidate_active_cagr.empty else None
+        ),
     }
 
     if ew is not None:
@@ -1522,6 +1717,119 @@ def _robustness_decision_summary(
         }
     )
 
+    asset_rows = parameter_sweep[
+        (parameter_sweep.get("VariantGroup", "") == "AssetSelection")
+        & (parameter_sweep.get("Status", "") == "OK")
+    ].copy()
+    if not asset_rows.empty:
+        asset_rows["Sharpe_Excess"] = pd.to_numeric(
+            asset_rows["Sharpe_Excess"], errors="coerce"
+        )
+        asset_rows["CAGR"] = pd.to_numeric(asset_rows["CAGR"], errors="coerce")
+        asset_rows = asset_rows.dropna(subset=["Sharpe_Excess"])
+
+    asset_base = _first_ok_row(parameter_sweep, "Label", "AssetSelection_Base")
+    asset_eq = _first_ok_row(parameter_sweep, "Label", "AssetSelection_EqualWeightSelected")
+    asset_top = _first_ok_row(parameter_sweep, "Label", "AssetSelection_TopMomentumOnly")
+    asset_min_vol = _first_ok_row(parameter_sweep, "Label", "AssetSelection_MinVolOnly")
+
+    best_asset = (
+        asset_rows.loc[asset_rows["Sharpe_Excess"].idxmax()]
+        if not asset_rows.empty
+        else None
+    )
+    random_rows = asset_rows[
+        asset_rows["Label"].astype(str).str.startswith("AssetSelection_RandomSameCashSeed_")
+    ].copy() if not asset_rows.empty else pd.DataFrame()
+    best_random = (
+        random_rows.loc[random_rows["Sharpe_Excess"].idxmax()]
+        if not random_rows.empty
+        else None
+    )
+
+    def _variant_delta(
+        left: Optional[pd.Series], right: Optional[pd.Series], key: str
+    ) -> Optional[float]:
+        left_value = _variant_value(left, key)
+        right_value = _variant_value(right, key)
+        if left_value is None or right_value is None:
+            return None
+        return left_value - right_value
+
+    base_cagr = _variant_value(asset_base, "CAGR")
+    base_sharpe = _variant_value(asset_base, "Sharpe_Excess")
+    random_median_cagr = (
+        float(random_rows["CAGR"].median()) if not random_rows.empty else None
+    )
+    random_median_sharpe = (
+        float(random_rows["Sharpe_Excess"].median()) if not random_rows.empty else None
+    )
+    random_best_cagr = _variant_value(best_random, "CAGR")
+    random_best_sharpe = _variant_value(best_random, "Sharpe_Excess")
+
+    asset_comparison_deltas = [
+        _variant_delta(asset_base, asset_eq, "Sharpe_Excess"),
+        _variant_delta(asset_base, asset_top, "Sharpe_Excess"),
+        _variant_delta(asset_base, asset_min_vol, "Sharpe_Excess"),
+    ]
+    base_vs_random_median_sharpe = (
+        base_sharpe - random_median_sharpe
+        if base_sharpe is not None and random_median_sharpe is not None
+        else None
+    )
+    if base_sharpe is None:
+        asset_selection_decision = "NO_ASSET_SELECTION_DATA"
+    elif base_vs_random_median_sharpe is not None and base_vs_random_median_sharpe < 0:
+        asset_selection_decision = "RANDOM_MEDIAN_BEATS_BASE"
+    elif any(delta is not None and delta < 0 for delta in asset_comparison_deltas):
+        asset_selection_decision = "SIMPLE_VARIANT_BEATS_BASE"
+    elif base_vs_random_median_sharpe is not None and base_vs_random_median_sharpe >= 0:
+        asset_selection_decision = "BASE_BEATS_SIMPLE_AND_RANDOM"
+    else:
+        asset_selection_decision = "MIXED_ASSET_SELECTION"
+
+    summary.update(
+        {
+            "BestAssetSelectionVariant": best_asset.get("Label") if best_asset is not None else None,
+            "BestAssetSelectionVariant_Sharpe_Excess": _variant_value(best_asset, "Sharpe_Excess"),
+            "BestAssetSelectionVariant_CAGR": _variant_value(best_asset, "CAGR"),
+            "BaseVsEqualWeightSelected_CAGR_Delta": _variant_delta(asset_base, asset_eq, "CAGR"),
+            "BaseVsEqualWeightSelected_Sharpe_Excess_Delta": _variant_delta(
+                asset_base, asset_eq, "Sharpe_Excess"
+            ),
+            "BaseVsTopMomentum_CAGR_Delta": _variant_delta(asset_base, asset_top, "CAGR"),
+            "BaseVsTopMomentum_Sharpe_Excess_Delta": _variant_delta(
+                asset_base, asset_top, "Sharpe_Excess"
+            ),
+            "BaseVsMinVol_CAGR_Delta": _variant_delta(asset_base, asset_min_vol, "CAGR"),
+            "BaseVsMinVol_Sharpe_Excess_Delta": _variant_delta(
+                asset_base, asset_min_vol, "Sharpe_Excess"
+            ),
+            "BaseVsRandomMedian_CAGR_Delta": (
+                base_cagr - random_median_cagr
+                if base_cagr is not None and random_median_cagr is not None
+                else None
+            ),
+            "BaseVsRandomMedian_Sharpe_Excess_Delta": base_vs_random_median_sharpe,
+            "BaseVsRandomBest_CAGR_Delta": (
+                base_cagr - random_best_cagr
+                if base_cagr is not None and random_best_cagr is not None
+                else None
+            ),
+            "BaseVsRandomBest_Sharpe_Excess_Delta": (
+                base_sharpe - random_best_sharpe
+                if base_sharpe is not None and random_best_sharpe is not None
+                else None
+            ),
+            "RandomMedianAssetSelection_CAGR": random_median_cagr,
+            "RandomMedianAssetSelection_Sharpe_Excess": random_median_sharpe,
+            "BestRandomAssetSelectionVariant": (
+                best_random.get("Label") if best_random is not None else None
+            ),
+            "AssetSelectionDecision": asset_selection_decision,
+        }
+    )
+
     decision, reasons = _classify_strategy(summary)
     summary["Decision"] = decision
     summary["Reason"] = reasons
@@ -1595,6 +1903,16 @@ def _write_summary_markdown(outdir: Path, summary: Dict[str, object]) -> None:
         f"- Best no-cash-timing variant: {summary.get('BestNoCashTimingVariant')}",
         f"- Best threshold-sweep variant: {summary.get('BestThresholdSweepVariant')}",
         "",
+        "## Asset Selection Ablation",
+        "",
+        f"- Best asset-selection variant: {summary.get('BestAssetSelectionVariant')}",
+        f"- Asset-selection decision: {summary.get('AssetSelectionDecision')}",
+        f"- Base vs equal-weight selected Sharpe delta: {_fmt_metric(summary.get('BaseVsEqualWeightSelected_Sharpe_Excess_Delta'))}",
+        f"- Base vs top momentum Sharpe delta: {_fmt_metric(summary.get('BaseVsTopMomentum_Sharpe_Excess_Delta'))}",
+        f"- Base vs min-vol Sharpe delta: {_fmt_metric(summary.get('BaseVsMinVol_Sharpe_Excess_Delta'))}",
+        f"- Base vs median random Sharpe delta: {_fmt_metric(summary.get('BaseVsRandomMedian_Sharpe_Excess_Delta'))}",
+        f"- Base vs best random Sharpe delta: {_fmt_metric(summary.get('BaseVsRandomBest_Sharpe_Excess_Delta'))}",
+        "",
         "## Benchmarks",
         "",
         f"- Best by excess Sharpe: {summary.get('BestBenchmarkBySharpe')}",
@@ -1605,6 +1923,15 @@ def _write_summary_markdown(outdir: Path, summary: Dict[str, object]) -> None:
         "",
         f"- Worst excess Sharpe: {_fmt_metric(summary.get('WalkForwardWorstSharpe'))}",
         f"- Negative fold count: {summary.get('WalkForwardNegativeFoldCount')}",
+        "",
+        "## Walk-Forward Candidate Selection",
+        "",
+        f"- Selected variant counts: {summary.get('WalkForwardSelectedVariantCounts')}",
+        f"- Worst test excess Sharpe: {_fmt_metric(summary.get('WalkForwardCandidateWorstSharpe'))}",
+        f"- Negative fold count: {summary.get('WalkForwardCandidateNegativeFoldCount')}",
+        f"- Median test excess Sharpe: {_fmt_metric(summary.get('WalkForwardCandidateMedianSharpe'))}",
+        f"- Mean test excess Sharpe: {_fmt_metric(summary.get('WalkForwardCandidateMeanSharpe'))}",
+        f"- Mean active test excess Sharpe: {_fmt_metric(summary.get('WalkForwardCandidateMeanActiveSharpe'))}",
         "",
         "## Reasons",
         "",
@@ -1648,6 +1975,99 @@ def _robustness_variants(
         (
             "CashTiming_ThresholdSweep_VeryLoose",
             {"dd_half": 0.12, "dd_safe": 0.20, "dd_exit": 0.10},
+        ),
+        (
+            "AssetSelection_Base",
+            {
+                "cash_policy": "fixed",
+                "fixed_cash_weight": avg_cash,
+                "asset_selection_mode": "base",
+            },
+        ),
+        (
+            "AssetSelection_EqualWeightSelected",
+            {
+                "cash_policy": "fixed",
+                "fixed_cash_weight": avg_cash,
+                "asset_selection_mode": "equal_weight_selected",
+            },
+        ),
+        (
+            "AssetSelection_TopMomentumOnly",
+            {
+                "cash_policy": "fixed",
+                "fixed_cash_weight": avg_cash,
+                "asset_selection_mode": "top_momentum_only",
+            },
+        ),
+        (
+            "AssetSelection_TopMomentumNoVolFilter",
+            {
+                "cash_policy": "fixed",
+                "fixed_cash_weight": avg_cash,
+                "asset_selection_mode": "top_momentum_no_vol_filter",
+            },
+        ),
+        (
+            "AssetSelection_MinVolOnly",
+            {
+                "cash_policy": "fixed",
+                "fixed_cash_weight": avg_cash,
+                "asset_selection_mode": "min_vol_only",
+            },
+        ),
+        (
+            "AssetSelection_RiskParitySelected",
+            {
+                "cash_policy": "fixed",
+                "fixed_cash_weight": avg_cash,
+                "asset_selection_mode": "risk_parity_selected",
+            },
+        ),
+        (
+            "AssetSelection_RandomSameCashSeed_1",
+            {
+                "cash_policy": "fixed",
+                "fixed_cash_weight": avg_cash,
+                "asset_selection_mode": "random_selected",
+                "asset_selection_seed": 1,
+            },
+        ),
+        (
+            "AssetSelection_RandomSameCashSeed_2",
+            {
+                "cash_policy": "fixed",
+                "fixed_cash_weight": avg_cash,
+                "asset_selection_mode": "random_selected",
+                "asset_selection_seed": 2,
+            },
+        ),
+        (
+            "AssetSelection_RandomSameCashSeed_3",
+            {
+                "cash_policy": "fixed",
+                "fixed_cash_weight": avg_cash,
+                "asset_selection_mode": "random_selected",
+                "asset_selection_seed": 3,
+            },
+        ),
+        (
+            "AssetSelection_RandomSameCashSeed_4",
+            {
+                "cash_policy": "fixed",
+                "fixed_cash_weight": avg_cash,
+                "asset_selection_mode": "random_selected",
+                "asset_selection_seed": 4,
+            },
+        ),
+        (
+            "AssetSelection_RandomSameCashSeed_5",
+            {
+                "cash_policy": "fixed",
+                "fixed_cash_weight": avg_cash,
+                "asset_selection_mode": "random_selected",
+                "asset_selection_seed": 5,
+            },
         ),
         ("vol_window_40", {"vol_window": 40}),
         ("vol_window_90", {"vol_window": 90}),
@@ -1722,6 +2142,8 @@ def _variant_group(name: str) -> str:
         return "NoCashTiming"
     if name.startswith("CashTiming_ThresholdSweep"):
         return "CashTiming_ThresholdSweep"
+    if name.startswith("AssetSelection_"):
+        return "AssetSelection"
     return "ParameterSweep"
 
 
@@ -1748,6 +2170,8 @@ def _parameter_sweep_table(
                     "FixedCashWeight": cfg.fixed_cash_weight,
                     "AvgCashWeight": avg_cash,
                     "AvgRiskWeight": 1.0 - avg_cash if not np.isnan(avg_cash) else np.nan,
+                    "AssetSelectionMode": cfg.asset_selection_mode,
+                    "AssetSelectionSeed": cfg.asset_selection_seed,
                     "DDHalf": cfg.dd_half,
                     "DDSafe": cfg.dd_safe,
                     "DDExit": cfg.dd_exit,
@@ -2633,6 +3057,93 @@ def _walk_forward_table(
     return pd.DataFrame(rows)
 
 
+def _candidate_variant_label(name: str) -> str:
+    return "Base" if name == "baseline" else name
+
+
+def _walk_forward_candidate_selection_table(
+    results: Dict[str, BacktestResult],
+    prices: pd.DataFrame,
+    daily_rf: pd.Series,
+    score_metric: str,
+    min_test_days: int = 126,
+) -> pd.DataFrame:
+    rows = []
+    data_start = prices.index[0]
+    data_end = prices.index[-1]
+    fold_train_start = data_start
+    fold_num = 1
+    candidate_names = [name for name in WALK_FORWARD_CANDIDATE_VARIANTS if name in results]
+    if "baseline" not in results or not candidate_names:
+        return pd.DataFrame(rows)
+
+    while True:
+        train_end = fold_train_start + pd.DateOffset(years=2) - pd.DateOffset(days=1)
+        test_start = train_end + pd.DateOffset(days=1)
+        test_end = min(test_start + pd.DateOffset(years=1) - pd.DateOffset(days=1), data_end)
+        if test_start >= data_end or train_end >= data_end:
+            break
+        if len(prices.loc[test_start:test_end]) < min_test_days:
+            break
+
+        scored: List[Tuple[float, str, Dict[str, float]]] = []
+        for name in candidate_names:
+            train_equity = results[name].equity_curve.loc[fold_train_start:train_end]
+            if len(train_equity) < 2:
+                continue
+            train_stats = _stats_from_equity(train_equity, daily_rf=daily_rf)
+            score_value = _metric_value(train_stats.get(score_metric))
+            score = -1e9 if score_value is None else score_value
+            scored.append((score, name, train_stats))
+
+        if not scored:
+            break
+
+        scored.sort(reverse=True, key=lambda x: x[0])
+        _train_score, selected_name, selected_train_stats = scored[0]
+        selected_equity = results[selected_name].equity_curve.loc[test_start:test_end]
+        baseline_equity = results["baseline"].equity_curve.loc[test_start:test_end]
+        idx = selected_equity.index.intersection(baseline_equity.index)
+        if len(idx) < 2:
+            break
+
+        test_equity = selected_equity.loc[idx]
+        benchmark_equity = baseline_equity.loc[idx]
+        rf = daily_rf.reindex(idx).fillna(0.0)
+        test_stats = _stats_from_equity(test_equity, daily_rf=rf)
+        benchmark_stats = _stats_from_equity(benchmark_equity, daily_rf=rf)
+
+        rows.append(
+            {
+                "Fold": f"fold_{fold_num}",
+                "TrainStart": str(fold_train_start.date()),
+                "TrainEnd": str(train_end.date()),
+                "TestStart": str(idx[0].date()),
+                "TestEnd": str(idx[-1].date()),
+                "SelectedVariant": _candidate_variant_label(selected_name),
+                "Train_CAGR": selected_train_stats.get("CAGR"),
+                "Train_MaxDD": selected_train_stats.get("MaxDrawdown"),
+                "Train_Sharpe_Excess": selected_train_stats.get("Sharpe_Excess"),
+                "Train_Calmar": selected_train_stats.get("Calmar"),
+                "Test_CAGR": test_stats.get("CAGR"),
+                "Test_MaxDD": test_stats.get("MaxDrawdown"),
+                "Test_Sharpe_Excess": test_stats.get("Sharpe_Excess"),
+                "Test_Calmar": test_stats.get("Calmar"),
+                "Test_Benchmark": "Base",
+                "Test_Active_CAGR": test_stats.get("CAGR") - benchmark_stats.get("CAGR"),
+                "Test_Active_Sharpe_Excess": test_stats.get("Sharpe_Excess")
+                - benchmark_stats.get("Sharpe_Excess"),
+                "Test_Drawdown_Reduction": benchmark_stats.get("MaxDrawdown")
+                - test_stats.get("MaxDrawdown"),
+            }
+        )
+
+        fold_num += 1
+        fold_train_start = fold_train_start + pd.DateOffset(years=1)
+
+    return pd.DataFrame(rows)
+
+
 def run_robustness_analysis(
     prices: pd.DataFrame,
     config: MatvmConfig,
@@ -2688,6 +3199,12 @@ def run_robustness_analysis(
             daily_rf=daily_rf,
         ),
         "walk_forward": _walk_forward_table(
+            results=variant_results,
+            prices=prices,
+            daily_rf=daily_rf,
+            score_metric=score_metric,
+        ),
+        "walkforward_candidate_selection": _walk_forward_candidate_selection_table(
             results=variant_results,
             prices=prices,
             daily_rf=daily_rf,
@@ -3446,7 +3963,15 @@ def cli_robustness(args: argparse.Namespace) -> None:
     print(f"{'Cash policy group':>22}: {summary.get('BestCashPolicyGroup')}")
     print(f"{'Dyn cash Sharpe delta':>22}: {_fmt_metric(summary.get('DynamicCashTiming_Sharpe_Delta_vs_BestCashPolicy'))}")
     print(f"{'Dyn cash CAGR delta':>22}: {_fmt_metric(summary.get('DynamicCashTiming_CAGR_Delta_vs_BestCashPolicy'), pct=True)}")
+    print(f"{'Best asset select':>22}: {summary.get('BestAssetSelectionVariant')}")
+    print(f"{'Asset select decision':>22}: {summary.get('AssetSelectionDecision')}")
+    print(f"{'Base vs EqSel Sharpe':>22}: {_fmt_metric(summary.get('BaseVsEqualWeightSelected_Sharpe_Excess_Delta'))}")
+    print(f"{'Base vs TopMom Sharpe':>22}: {_fmt_metric(summary.get('BaseVsTopMomentum_Sharpe_Excess_Delta'))}")
+    print(f"{'Base vs MinVol Sharpe':>22}: {_fmt_metric(summary.get('BaseVsMinVol_Sharpe_Excess_Delta'))}")
+    print(f"{'Base vs RandMed':>22}: {_fmt_metric(summary.get('BaseVsRandomMedian_Sharpe_Excess_Delta'))}")
     print(f"{'WF negative folds':>22}: {summary.get('WalkForwardNegativeFoldCount')}")
+    print(f"{'WF cand neg folds':>22}: {summary.get('WalkForwardCandidateNegativeFoldCount')}")
+    print(f"{'WF cand mean Sharpe':>22}: {_fmt_metric(summary.get('WalkForwardCandidateMeanSharpe'))}")
     reasons = summary.get("Reason") or []
     if reasons:
         print(f"{'Primary reason':>22}: {reasons[0]}")
@@ -3484,6 +4009,8 @@ def cli_robustness(args: argparse.Namespace) -> None:
         "CashPolicy",
         "FixedCashWeight",
         "AvgCashWeight",
+        "AssetSelectionMode",
+        "AssetSelectionSeed",
         "Status",
         "ActualStart",
         "ActualEnd",
@@ -3542,6 +4069,26 @@ def cli_robustness(args: argparse.Namespace) -> None:
         ]
         print("\n=== Walk-forward selected variants ===")
         print(tables["walk_forward"][[c for c in wf_cols if c in tables["walk_forward"].columns]].to_string(index=False))
+
+    if not tables["walkforward_candidate_selection"].empty:
+        candidate_cols = [
+            "Fold",
+            "TrainStart",
+            "TrainEnd",
+            "TestStart",
+            "TestEnd",
+            "SelectedVariant",
+            "Train_Sharpe_Excess",
+            "Test_Sharpe_Excess",
+            "Test_Active_Sharpe_Excess",
+            "Test_Drawdown_Reduction",
+        ]
+        print("\n=== Walk-forward candidate selection ===")
+        print(
+            tables["walkforward_candidate_selection"][
+                [c for c in candidate_cols if c in tables["walkforward_candidate_selection"].columns]
+            ].to_string(index=False)
+        )
 
 
 def cli_live_ibkr(args: argparse.Namespace) -> None:
