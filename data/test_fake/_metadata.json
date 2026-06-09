@@ -1,0 +1,75 @@
+{
+  "adjusted": false,
+  "downloaded_at_utc": "2026-06-09T12:54:28.580281+00:00",
+  "price_column": "adj_close",
+  "source": "make_test_placeholder_data.py",
+  "tickers": {
+    "IAU": {
+      "adjusted": false,
+      "downloaded_at_utc": "2026-06-09T12:54:28.580281+00:00",
+      "file": "IAU.csv",
+      "first_date": "2014-01-01",
+      "last_date": "2025-12-31",
+      "price_column": "adj_close",
+      "rows": 3131,
+      "source": "make_test_placeholder_data.py",
+      "ticker": "IAU"
+    },
+    "PDBC": {
+      "adjusted": false,
+      "downloaded_at_utc": "2026-06-09T12:54:28.580281+00:00",
+      "file": "PDBC.csv",
+      "first_date": "2014-01-01",
+      "last_date": "2025-12-31",
+      "price_column": "adj_close",
+      "rows": 3131,
+      "source": "make_test_placeholder_data.py",
+      "ticker": "PDBC"
+    },
+    "SGOV": {
+      "adjusted": false,
+      "downloaded_at_utc": "2026-06-09T12:54:28.580281+00:00",
+      "file": "SGOV.csv",
+      "first_date": "2014-01-01",
+      "last_date": "2025-12-31",
+      "price_column": "adj_close",
+      "rows": 3131,
+      "source": "make_test_placeholder_data.py",
+      "ticker": "SGOV"
+    },
+    "TLT": {
+      "adjusted": false,
+      "downloaded_at_utc": "2026-06-09T12:54:28.580281+00:00",
+      "file": "TLT.csv",
+      "first_date": "2014-01-01",
+      "last_date": "2025-12-31",
+      "price_column": "adj_close",
+      "rows": 3131,
+      "source": "make_test_placeholder_data.py",
+      "ticker": "TLT"
+    },
+    "VTI": {
+      "adjusted": false,
+      "downloaded_at_utc": "2026-06-09T12:54:28.580281+00:00",
+      "file": "VTI.csv",
+      "first_date": "2014-01-01",
+      "last_date": "2025-12-31",
+      "price_column": "adj_close",
+      "rows": 3131,
+      "source": "make_test_placeholder_data.py",
+      "ticker": "VTI"
+    },
+    "VXUS": {
+      "adjusted": false,
+      "downloaded_at_utc": "2026-06-09T12:54:28.580281+00:00",
+      "file": "VXUS.csv",
+      "first_date": "2014-01-01",
+      "last_date": "2025-12-31",
+      "price_column": "adj_close",
+      "rows": 3131,
+      "source": "make_test_placeholder_data.py",
+      "ticker": "VXUS"
+    }
+  },
+  "warning": "Synthetic placeholder data for tests only. Do not use for strategy evaluation."
+}

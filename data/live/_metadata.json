@@ -1,0 +1,77 @@
+{
+  "adjusted": true,
+  "ca_bundle": null,
+  "downloaded_at_utc": "2026-06-09T12:57:45.866516+00:00",
+  "end": null,
+  "price_column": "adj_close",
+  "source": "auto",
+  "start": "2005-01-01",
+  "tickers": {
+    "IAU": {
+      "adjusted": true,
+      "downloaded_at_utc": "2026-06-09T12:57:45.866516+00:00",
+      "file": "IAU.csv",
+      "first_date": "2005-01-28",
+      "last_date": "2026-06-08",
+      "price_column": "adj_close",
+      "rows": 5373,
+      "source": "yahoo-chart",
+      "ticker": "IAU"
+    },
+    "PDBC": {
+      "adjusted": true,
+      "downloaded_at_utc": "2026-06-09T12:57:45.866516+00:00",
+      "file": "PDBC.csv",
+      "first_date": "2014-11-07",
+      "last_date": "2026-06-08",
+      "price_column": "adj_close",
+      "rows": 2911,
+      "source": "yahoo-chart",
+      "ticker": "PDBC"
+    },
+    "SGOV": {
+      "adjusted": true,
+      "downloaded_at_utc": "2026-06-09T12:57:45.866516+00:00",
+      "file": "SGOV.csv",
+      "first_date": "2020-06-01",
+      "last_date": "2026-06-08",
+      "price_column": "adj_close",
+      "rows": 1513,
+      "source": "yahoo-chart",
+      "ticker": "SGOV"
+    },
+    "TLT": {
+      "adjusted": true,
+      "downloaded_at_utc": "2026-06-09T12:57:45.866516+00:00",
+      "file": "TLT.csv",
+      "first_date": "2005-01-03",
+      "last_date": "2026-06-08",
+      "price_column": "adj_close",
+      "rows": 5391,
+      "source": "yahoo-chart",
+      "ticker": "TLT"
+    },
+    "VTI": {
+      "adjusted": true,
+      "downloaded_at_utc": "2026-06-09T12:57:45.866516+00:00",
+      "file": "VTI.csv",
+      "first_date": "2005-01-03",
+      "last_date": "2026-06-08",
+      "price_column": "adj_close",
+      "rows": 5391,
+      "source": "yahoo-chart",
+      "ticker": "VTI"
+    },
+    "VXUS": {
+      "adjusted": true,
+      "downloaded_at_utc": "2026-06-09T12:57:45.866516+00:00",
+      "file": "VXUS.csv",
+      "first_date": "2011-01-28",
+      "last_date": "2026-06-08",
+      "price_column": "adj_close",
+      "rows": 3862,
+      "source": "yahoo-chart",
+      "ticker": "VXUS"
+    }
+  }
+}
