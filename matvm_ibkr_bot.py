@@ -174,6 +174,7 @@ class MatvmConfig:
     safe_mode_ramp_weeks: int = 4
 
     # Rebalancing / costs
+    rebalance_freq: str = "W-FRI"
     rebalance_abs_threshold: float = 0.02
     rebalance_rel_threshold: float = 0.15
     tcost_bps: float = 1.0
@@ -190,6 +191,10 @@ class MatvmConfig:
         if str(self.risk_free_mode).strip().lower() == "ticker" and self.risk_free_ticker:
             tickers.append(self.risk_free_ticker)
         return list(dict.fromkeys(tickers))
+
+    def required_history_days(self) -> int:
+        signal_need = max(self.momentum_windows + (self.sma_window, self.vol_window + 1))
+        return max(int(self.min_history_days), int(signal_need))
 
 
 @dataclass
@@ -431,7 +436,7 @@ class MatvmStrategy:
         prices = prices.sort_index()
 
         # Warmup guard
-        if len(prices.loc[:asof]) < self.cfg.min_history_days:
+        if len(prices.loc[:asof]) < self.cfg.required_history_days():
             w = pd.Series(0.0, index=self.cfg.all_tickers())
             w[self.cfg.cash_ticker] = 1.0
             return w
@@ -667,9 +672,9 @@ def backtest(
     rets = simple_returns(prices)
     portfolio_rets = rets[tickers]
 
-    # Determine signal dates: actual last trading day of each week
-    last_trading_each_week = prices.index.to_series().resample("W-FRI").last().dropna()
-    signal_dates = pd.DatetimeIndex(last_trading_each_week.values)
+    # Determine signal dates: actual last trading day in each rebalance period.
+    last_trading_each_period = prices.index.to_series().resample(config.rebalance_freq).last().dropna()
+    signal_dates = pd.DatetimeIndex(last_trading_each_period.values)
     signal_set = set(signal_dates)
 
     strategy = MatvmStrategy(config=config)
@@ -818,6 +823,403 @@ def plot_equity_and_drawdown(equity: pd.Series, outpath: Optional[Path] = None) 
         fig.savefig(outpath, dpi=150)
     else:
         plt.show()
+
+
+# -----------------------------
+# Robustness analysis
+# -----------------------------
+
+
+ROBUSTNESS_START_DATES: Tuple[str, ...] = (
+    "2018-01-01",
+    "2019-01-01",
+    "2020-01-01",
+    "2021-01-01",
+    "2022-01-01",
+    "2023-01-01",
+)
+
+REGIME_PERIODS: Tuple[Tuple[str, str, str], ...] = (
+    ("2020 crash", "2020-02-19", "2020-04-30"),
+    ("2022 inflation/rate shock", "2022-01-01", "2022-12-31"),
+    ("2023-2024 rebound", "2023-01-01", "2024-12-31"),
+)
+
+
+def _clone_config(config: MatvmConfig, **updates: object) -> MatvmConfig:
+    cfg = dataclasses.replace(config)
+    cfg.risk_tickers = list(config.risk_tickers)
+    cfg.momentum_windows = tuple(config.momentum_windows)
+    for key, value in updates.items():
+        setattr(cfg, key, value)
+    return cfg
+
+
+def _parse_date_list(raw: str) -> List[str]:
+    dates = [part.strip() for part in raw.split(",") if part.strip()]
+    if not dates:
+        raise ValueError("At least one date is required")
+    for value in dates:
+        pd.Timestamp(value)
+    return dates
+
+
+def _slice_prices(
+    prices: pd.DataFrame,
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+) -> pd.DataFrame:
+    out = prices
+    if start:
+        out = out.loc[pd.Timestamp(start) :]
+    if end:
+        out = out.loc[: pd.Timestamp(end)]
+    return out.copy()
+
+
+def _stats_from_equity(equity: pd.Series, daily_rf: pd.Series) -> Dict[str, float]:
+    daily_returns = equity.pct_change().fillna(0.0)
+    daily_rf = daily_rf.reindex_like(daily_returns).fillna(0.0)
+    stats = {
+        "CAGR": cagr(equity),
+        "MaxDrawdown": max_drawdown(equity),
+        "Sharpe_RF0": sharpe_ratio(daily_returns),
+        "Sortino_RF0": sortino_ratio(daily_returns),
+        "Sharpe_Excess": sharpe_ratio(daily_returns, daily_rf=daily_rf),
+        "Sortino_Excess": sortino_ratio(daily_returns, daily_rf=daily_rf),
+    }
+    stats["Calmar"] = (
+        stats["CAGR"] / stats["MaxDrawdown"] if stats["MaxDrawdown"] > 0 else 0.0
+    )
+    return stats
+
+
+def _period_stats_row(
+    label: str,
+    requested_start: Optional[str],
+    requested_end: Optional[str],
+    equity: pd.Series,
+    daily_rf: pd.Series,
+    extra: Optional[Dict[str, object]] = None,
+) -> Dict[str, object]:
+    row: Dict[str, object] = {
+        "Label": label,
+        "RequestedStart": requested_start,
+        "RequestedEnd": requested_end,
+        "Status": "NO_DATA",
+        "ActualStart": None,
+        "ActualEnd": None,
+        "Days": 0,
+    }
+    if extra:
+        row.update(extra)
+
+    equity = equity.dropna()
+    if len(equity) < 2:
+        return row
+
+    row.update(
+        {
+            "Status": "OK",
+            "ActualStart": str(equity.index[0].date()),
+            "ActualEnd": str(equity.index[-1].date()),
+            "Days": int(len(equity)),
+        }
+    )
+    row.update(_stats_from_equity(equity, daily_rf=daily_rf))
+    return row
+
+
+def _daily_rf_for_prices(prices: pd.DataFrame, config: MatvmConfig) -> pd.Series:
+    rets = simple_returns(prices[config.required_price_tickers()])
+    return get_daily_rf(rets, config)
+
+
+def _robustness_variants(base_config: MatvmConfig) -> List[Tuple[str, MatvmConfig]]:
+    definitions: List[Tuple[str, Dict[str, object]]] = [
+        ("baseline", {}),
+        ("vol_window_40", {"vol_window": 40}),
+        ("vol_window_90", {"vol_window": 90}),
+        ("sma_window_150", {"sma_window": 150}),
+        ("sma_window_250", {"sma_window": 250}),
+        ("momentum_short_21_63_126", {"momentum_windows": (21, 63, 126)}),
+        ("momentum_long_126_252_504", {"momentum_windows": (126, 252, 504)}),
+        ("vol_target_6pct", {"vol_target": 0.06}),
+        ("vol_target_10pct", {"vol_target": 0.10}),
+        ("weight_cap_25pct", {"weight_cap": 0.25}),
+        ("weight_cap_50pct", {"weight_cap": 0.50}),
+        ("confirm_1", {"confirm_signals": 1}),
+        ("confirm_3", {"confirm_signals": 3}),
+        ("breadth_min_2", {"breadth_min": 2}),
+        ("breadth_min_4", {"breadth_min": 4}),
+        ("rebalance_2w", {"rebalance_freq": "2W-FRI"}),
+        ("rebalance_month_end", {"rebalance_freq": "ME"}),
+    ]
+    return [(name, _clone_config(base_config, **updates)) for name, updates in definitions]
+
+
+def _start_date_sensitivity(
+    prices: pd.DataFrame,
+    config: MatvmConfig,
+    start_dates: Sequence[str],
+    initial_capital: float,
+) -> pd.DataFrame:
+    rows = []
+    for start in start_dates:
+        sliced = _slice_prices(prices, start=start)
+        try:
+            res = backtest(prices=sliced, config=config, initial_capital=initial_capital)
+            daily_rf = _daily_rf_for_prices(sliced, config).reindex(res.equity_curve.index)
+            row = _period_stats_row(
+                label=start,
+                requested_start=start,
+                requested_end=None,
+                equity=res.equity_curve,
+                daily_rf=daily_rf,
+                extra={"Trades": int(len(res.trades))},
+            )
+        except Exception as exc:
+            row = {
+                "Label": start,
+                "RequestedStart": start,
+                "RequestedEnd": None,
+                "Status": f"ERROR: {exc}",
+                "ActualStart": None,
+                "ActualEnd": None,
+                "Days": 0,
+                "Trades": 0,
+            }
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def _precompute_variant_results(
+    prices: pd.DataFrame,
+    variants: Sequence[Tuple[str, MatvmConfig]],
+    initial_capital: float,
+) -> Dict[str, BacktestResult]:
+    out: Dict[str, BacktestResult] = {}
+    for name, cfg in variants:
+        out[name] = backtest(prices=prices, config=cfg, initial_capital=initial_capital)
+    return out
+
+
+def _parameter_sweep_table(
+    results: Dict[str, BacktestResult],
+    daily_rf: pd.Series,
+) -> pd.DataFrame:
+    rows = []
+    for name, res in results.items():
+        row = _period_stats_row(
+            label=name,
+            requested_start=None,
+            requested_end=None,
+            equity=res.equity_curve,
+            daily_rf=daily_rf,
+            extra={"Trades": int(len(res.trades))},
+        )
+        rows.append(row)
+    return pd.DataFrame(rows).sort_values("Sharpe_Excess", ascending=False, na_position="last")
+
+
+def _regime_table(
+    baseline: BacktestResult,
+    prices: pd.DataFrame,
+    daily_rf: pd.Series,
+) -> pd.DataFrame:
+    periods = list(REGIME_PERIODS)
+    recent_start = (prices.index[-1] - pd.DateOffset(years=1)).date().isoformat()
+    recent_end = prices.index[-1].date().isoformat()
+    periods.append(("recent 1y", recent_start, recent_end))
+
+    rows = []
+    for label, start, end in periods:
+        equity = baseline.equity_curve.loc[pd.Timestamp(start) : pd.Timestamp(end)]
+        rows.append(
+            _period_stats_row(
+                label=label,
+                requested_start=start,
+                requested_end=end,
+                equity=equity,
+                daily_rf=daily_rf,
+            )
+        )
+    return pd.DataFrame(rows)
+
+
+def _benchmark_table(
+    prices: pd.DataFrame,
+    config: MatvmConfig,
+    daily_rf: pd.Series,
+) -> pd.DataFrame:
+    benchmarks: List[Tuple[str, Dict[str, float]]] = [
+        ("VTI buy_hold", {"VTI": 1.0}),
+        ("60_40 VTI_TLT", {"VTI": 0.60, "TLT": 0.40}),
+        ("equal_weight_risk_universe", {t: 1.0 / len(config.risk_tickers) for t in config.risk_tickers}),
+    ]
+
+    rets = simple_returns(prices)
+    rows = []
+    for label, weights in benchmarks:
+        active = {t: w for t, w in weights.items() if t in rets.columns}
+        if not active:
+            rows.append(
+                {
+                    "Label": label,
+                    "Status": "NO_DATA",
+                    "ActualStart": None,
+                    "ActualEnd": None,
+                    "Days": 0,
+                }
+            )
+            continue
+
+        w = pd.Series(active, dtype=float)
+        w = w / w.sum()
+        bench_daily = (rets[w.index] * w).sum(axis=1)
+        equity = (1.0 + bench_daily).cumprod()
+        rows.append(
+            _period_stats_row(
+                label=label,
+                requested_start=None,
+                requested_end=None,
+                equity=equity,
+                daily_rf=daily_rf,
+            )
+        )
+    return pd.DataFrame(rows).sort_values("Sharpe_Excess", ascending=False, na_position="last")
+
+
+def _walk_forward_table(
+    results: Dict[str, BacktestResult],
+    prices: pd.DataFrame,
+    daily_rf: pd.Series,
+    score_metric: str,
+    min_test_days: int = 126,
+) -> pd.DataFrame:
+    rows = []
+    data_start = prices.index[0]
+    data_end = prices.index[-1]
+    fold_train_start = data_start
+    fold_num = 1
+
+    while True:
+        train_end = fold_train_start + pd.DateOffset(years=2) - pd.DateOffset(days=1)
+        test_start = train_end + pd.DateOffset(days=1)
+        test_end = min(test_start + pd.DateOffset(years=1) - pd.DateOffset(days=1), data_end)
+        if test_start >= data_end or train_end >= data_end:
+            break
+        if len(prices.loc[test_start:test_end]) < min_test_days:
+            break
+
+        scored: List[Tuple[float, str, Dict[str, float]]] = []
+        for name, res in results.items():
+            train_equity = res.equity_curve.loc[fold_train_start:train_end]
+            if len(train_equity) < 2:
+                continue
+            train_stats = _stats_from_equity(train_equity, daily_rf=daily_rf)
+            score = _safe_float(float(train_stats.get(score_metric, np.nan)), default=-1e9)
+            scored.append((score, name, train_stats))
+
+        if not scored:
+            break
+
+        scored.sort(reverse=True, key=lambda x: x[0])
+        train_score, selected_name, selected_train_stats = scored[0]
+        selected_equity = results[selected_name].equity_curve.loc[test_start:test_end]
+        row = _period_stats_row(
+            label=f"fold_{fold_num}",
+            requested_start=str(test_start.date()),
+            requested_end=str(test_end.date()),
+            equity=selected_equity,
+            daily_rf=daily_rf,
+            extra={
+                "TrainStart": str(fold_train_start.date()),
+                "TrainEnd": str(train_end.date()),
+                "SelectedVariant": selected_name,
+                "TrainScoreMetric": score_metric,
+                "TrainScore": train_score,
+                "TrainSharpe_Excess": selected_train_stats["Sharpe_Excess"],
+                "TrainCalmar": selected_train_stats["Calmar"],
+            },
+        )
+        rows.append(row)
+
+        fold_num += 1
+        fold_train_start = fold_train_start + pd.DateOffset(years=1)
+
+    return pd.DataFrame(rows)
+
+
+def run_robustness_analysis(
+    prices: pd.DataFrame,
+    config: MatvmConfig,
+    initial_capital: float,
+    start_dates: Sequence[str],
+    outdir: Path,
+    score_metric: str = "Sharpe_Excess",
+) -> Dict[str, pd.DataFrame]:
+    prices = _ensure_datetime_index(prices).sort_index()
+    required = config.required_price_tickers()
+    prices = prices[required].ffill().dropna()
+    daily_rf = _daily_rf_for_prices(prices, config)
+
+    baseline = backtest(prices=prices, config=config, initial_capital=initial_capital)
+    variants = _robustness_variants(config)
+    variant_results = _precompute_variant_results(
+        prices=prices,
+        variants=variants,
+        initial_capital=initial_capital,
+    )
+
+    tables = {
+        "start_dates": _start_date_sensitivity(
+            prices=prices,
+            config=config,
+            start_dates=start_dates,
+            initial_capital=initial_capital,
+        ),
+        "parameter_sweep": _parameter_sweep_table(
+            results=variant_results,
+            daily_rf=daily_rf,
+        ),
+        "regimes": _regime_table(
+            baseline=baseline,
+            prices=prices,
+            daily_rf=daily_rf,
+        ),
+        "benchmarks": _benchmark_table(
+            prices=prices,
+            config=config,
+            daily_rf=daily_rf,
+        ),
+        "walk_forward": _walk_forward_table(
+            results=variant_results,
+            prices=prices,
+            daily_rf=daily_rf,
+            score_metric=score_metric,
+        ),
+    }
+
+    outdir.mkdir(parents=True, exist_ok=True)
+    for name, df in tables.items():
+        df.to_csv(outdir / f"robustness_{name}.csv", index=False, lineterminator="\n")
+
+    summary = {
+        "run_at_utc": _dt_utc_now().isoformat(),
+        "effective_start": str(prices.index[0].date()),
+        "effective_end": str(prices.index[-1].date()),
+        "risk_free_mode": config.risk_free_mode,
+        "risk_free_ticker": config.risk_free_ticker,
+        "cash_ticker": config.cash_ticker,
+        "score_metric": score_metric,
+        "tables": {name: f"robustness_{name}.csv" for name in tables},
+    }
+    (outdir / "robustness_summary.json").write_text(
+        json.dumps(summary, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    return tables
 
 
 # -----------------------------
@@ -1357,8 +1759,7 @@ def _make_default_config() -> MatvmConfig:
     return MatvmConfig()
 
 
-def cli_backtest(args: argparse.Namespace) -> None:
-    cfg = _make_default_config()
+def _apply_common_config_args(cfg: MatvmConfig, args: argparse.Namespace) -> MatvmConfig:
     if args.risk:
         cfg.risk_tickers = [s.strip().upper() for s in args.risk.split(",") if s.strip()]
     if args.cash:
@@ -1372,6 +1773,22 @@ def cli_backtest(args: argparse.Namespace) -> None:
     if cfg.risk_free_mode == "ticker" and not cfg.risk_free_ticker:
         raise SystemExit("--risk-free-ticker is required when --risk-free-mode ticker")
 
+    return cfg
+
+
+def _print_data_audit(audit: DataAuditResult) -> None:
+    if not audit.has_issues():
+        return
+    print("\n=== DATA AUDIT ===")
+    for err in audit.errors:
+        print(f"ERROR:   {err}")
+    for warning in audit.warnings:
+        print(f"WARNING: {warning}")
+
+
+def cli_backtest(args: argparse.Namespace) -> None:
+    cfg = _apply_common_config_args(_make_default_config(), args)
+
     tickers = cfg.required_price_tickers()
 
     if args.csv_folder:
@@ -1381,11 +1798,7 @@ def cli_backtest(args: argparse.Namespace) -> None:
 
     audit = audit_price_data(prices, cfg)
     if audit.has_issues():
-        print("\n=== DATA AUDIT ===")
-        for err in audit.errors:
-            print(f"ERROR:   {err}")
-        for warning in audit.warnings:
-            print(f"WARNING: {warning}")
+        _print_data_audit(audit)
         if audit.errors:
             raise SystemExit("Data audit failed with errors.")
         if args.strict_data:
@@ -1425,6 +1838,87 @@ def cli_backtest(args: argparse.Namespace) -> None:
         plot_equity_and_drawdown(res.equity_curve, outpath=outdir / "equity_drawdown.png")
 
     print(f"\nWrote results to: {outdir.resolve()}")
+
+
+def cli_robustness(args: argparse.Namespace) -> None:
+    cfg = _apply_common_config_args(_make_default_config(), args)
+    tickers = cfg.required_price_tickers()
+
+    if args.csv_folder:
+        prices = load_prices_from_csv(Path(args.csv_folder), tickers)
+    else:
+        prices = load_prices_from_yfinance(tickers, start=args.start, end=args.end)
+
+    audit = audit_price_data(prices, cfg)
+    if audit.has_issues():
+        _print_data_audit(audit)
+        if audit.errors:
+            raise SystemExit("Data audit failed with errors.")
+        if not args.allow_data_warnings:
+            raise SystemExit("Robustness analysis requires clean data. Use --allow-data-warnings to override.")
+
+    start_dates = _parse_date_list(args.start_dates)
+    outdir = Path(args.outdir)
+    tables = run_robustness_analysis(
+        prices=prices,
+        config=cfg,
+        initial_capital=float(args.initial),
+        start_dates=start_dates,
+        outdir=outdir,
+        score_metric=args.score_metric,
+    )
+
+    print("\n=== Robustness status ===")
+    if audit.has_issues():
+        print(f"{'Backtest status':>22}: DIAGNOSTIC ONLY")
+        print(f"{'Reason':>22}: data audit warnings detected")
+    else:
+        print(f"{'Backtest status':>22}: CLEAN DATA CHECK PASSED")
+    print(f"{'Cash asset':>22}: {cfg.cash_ticker}")
+    print(f"{'Risk-free mode':>22}: {cfg.risk_free_mode}")
+    if cfg.risk_free_mode == "ticker":
+        print(f"{'Risk-free ticker':>22}: {cfg.risk_free_ticker}")
+    print(f"{'Output folder':>22}: {outdir.resolve()}")
+
+    display_cols = [
+        "Label",
+        "Status",
+        "ActualStart",
+        "ActualEnd",
+        "CAGR",
+        "MaxDrawdown",
+        "Sharpe_RF0",
+        "Sharpe_Excess",
+        "Calmar",
+    ]
+    print("\n=== Start-date sensitivity ===")
+    print(tables["start_dates"][[c for c in display_cols if c in tables["start_dates"].columns]].to_string(index=False))
+
+    print("\n=== Top parameter variants by Sharpe_Excess ===")
+    sweep = tables["parameter_sweep"].head(8)
+    print(sweep[[c for c in display_cols if c in sweep.columns]].to_string(index=False))
+
+    print("\n=== Regime breakdown ===")
+    print(tables["regimes"][[c for c in display_cols if c in tables["regimes"].columns]].to_string(index=False))
+
+    print("\n=== Benchmarks ===")
+    print(tables["benchmarks"][[c for c in display_cols if c in tables["benchmarks"].columns]].to_string(index=False))
+
+    if not tables["walk_forward"].empty:
+        wf_cols = [
+            "Label",
+            "Status",
+            "TrainStart",
+            "TrainEnd",
+            "RequestedStart",
+            "RequestedEnd",
+            "SelectedVariant",
+            "TrainScore",
+            "Sharpe_Excess",
+            "Calmar",
+        ]
+        print("\n=== Walk-forward selected variants ===")
+        print(tables["walk_forward"][[c for c in wf_cols if c in tables["walk_forward"].columns]].to_string(index=False))
 
 
 def cli_live_ibkr(args: argparse.Namespace) -> None:
@@ -1502,6 +1996,54 @@ def build_parser() -> argparse.ArgumentParser:
         help="Fail the backtest when data audit warnings are found",
     )
     b.set_defaults(func=cli_backtest)
+
+    # Robustness
+    r = sub.add_parser("robustness", help="Run robustness analysis on clean backtest data")
+    r.add_argument("--start", default="2014-01-01")
+    r.add_argument("--end", default="2025-12-31")
+    r.add_argument("--initial", default="100000")
+    r.add_argument("--risk", default=None, help="Comma-separated risk tickers")
+    r.add_argument("--cash", default=None, help="Cash ticker")
+    r.add_argument(
+        "--risk-free-mode",
+        choices=sorted(RISK_FREE_MODES),
+        default="ticker",
+        help="Benchmark for excess-return Sharpe/Sortino",
+    )
+    r.add_argument(
+        "--risk-free-ticker",
+        default="SGOV",
+        help="Ticker to use when --risk-free-mode ticker",
+    )
+    r.add_argument(
+        "--annual-risk-free-rate",
+        type=float,
+        default=0.0,
+        help="Decimal annual rate to use when --risk-free-mode constant, e.g. 0.05",
+    )
+    r.add_argument(
+        "--csv-folder",
+        default="./data",
+        help="Folder with <TICKER>.csv files. If it contains data/live, that folder is preferred.",
+    )
+    r.add_argument(
+        "--start-dates",
+        default=",".join(ROBUSTNESS_START_DATES),
+        help="Comma-separated start dates for sensitivity analysis",
+    )
+    r.add_argument(
+        "--score-metric",
+        choices=["Sharpe_Excess", "Sharpe_RF0", "Calmar", "CAGR"],
+        default="Sharpe_Excess",
+        help="Metric used to select variants in walk-forward analysis",
+    )
+    r.add_argument("--outdir", default="./matvm_out/robustness")
+    r.add_argument(
+        "--allow-data-warnings",
+        action="store_true",
+        help="Run even when the data audit reports warnings",
+    )
+    r.set_defaults(func=cli_robustness)
 
     # Live IBKR
     l = sub.add_parser("live-ibkr", help="Run one live rebalance against IBKR")
