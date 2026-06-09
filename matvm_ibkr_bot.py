@@ -5,6 +5,7 @@ import dataclasses
 import json
 import math
 import os
+import subprocess
 import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -85,7 +86,7 @@ def sharpe_ratio(daily_returns: pd.Series, daily_rf: Optional[pd.Series] = None)
     mu = r.mean()
     sd = r.std(ddof=0)
     if sd < MIN_DAILY_RETURN_STD or np.isnan(sd):
-        return 0.0
+        return float("nan")
     return float((mu / sd) * math.sqrt(TRADING_DAYS_PER_YEAR))
 
 
@@ -98,7 +99,7 @@ def sortino_ratio(daily_returns: pd.Series, daily_rf: Optional[pd.Series] = None
     downside = r[r < 0]
     dd = downside.std(ddof=0)
     if dd < MIN_DAILY_RETURN_STD or np.isnan(dd):
-        return 0.0
+        return float("nan")
     return float((mu / dd) * math.sqrt(TRADING_DAYS_PER_YEAR))
 
 
@@ -979,6 +980,50 @@ def _daily_rf_for_prices(prices: pd.DataFrame, config: MatvmConfig) -> pd.Series
     return get_daily_rf(rets, config)
 
 
+def _git_commit() -> Optional[str]:
+    try:
+        repo = Path(__file__).resolve().parent
+        res = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=repo,
+            capture_output=True,
+            check=True,
+            text=True,
+            timeout=5,
+        )
+        commit = res.stdout.strip()
+        return commit or None
+    except Exception:
+        return None
+
+
+def _run_metadata_columns(
+    config: MatvmConfig,
+    backtest_status: str,
+    data_audit_status: str,
+    git_commit: Optional[str],
+) -> Dict[str, object]:
+    return {
+        "CashExecution": config.cash_ticker,
+        "CashReturnMode": config.cash_return_mode,
+        "CashReturnTicker": config.cash_return_ticker,
+        "AnnualCashReturnRate": float(config.annual_cash_return_rate),
+        "RiskFreeMode": config.risk_free_mode,
+        "RiskFreeTicker": config.risk_free_ticker,
+        "AnnualRiskFreeRate": float(config.annual_risk_free_rate),
+        "BacktestStatus": backtest_status,
+        "DataAuditStatus": data_audit_status,
+        "GitCommit": git_commit,
+    }
+
+
+def _add_run_metadata(df: pd.DataFrame, metadata: Dict[str, object]) -> pd.DataFrame:
+    out = df.copy()
+    for key, value in reversed(list(metadata.items())):
+        out.insert(0, key, value)
+    return out
+
+
 def _robustness_variants(base_config: MatvmConfig) -> List[Tuple[str, MatvmConfig]]:
     definitions: List[Tuple[str, Dict[str, object]]] = [
         ("baseline", {}),
@@ -1091,25 +1136,75 @@ def _regime_table(
     return pd.DataFrame(rows)
 
 
+def _benchmark_return_frame(prices: pd.DataFrame, config: MatvmConfig) -> pd.DataFrame:
+    rets = simple_returns(prices)
+    out = pd.DataFrame(index=prices.index)
+    for ticker in config.risk_tickers:
+        if ticker in rets.columns:
+            out[ticker] = rets[ticker]
+    out[config.cash_ticker] = get_daily_cash_returns(rets, config)
+    return out
+
+
+def _benchmark_equity(returns: pd.DataFrame, weights: Dict[str, float]) -> Optional[pd.Series]:
+    active = {t: w for t, w in weights.items() if t in returns.columns}
+    if not active:
+        return None
+
+    w = pd.Series(active, dtype=float)
+    w = w / w.sum()
+    bench_daily = (returns[w.index] * w).sum(axis=1)
+    return (1.0 + bench_daily).cumprod()
+
+
+def _benchmark_specs(
+    prices: pd.DataFrame,
+    config: MatvmConfig,
+    daily_rf: pd.Series,
+) -> List[Tuple[str, Dict[str, float], str]]:
+    returns = _benchmark_return_frame(prices, config)
+    specs: List[Tuple[str, Dict[str, float], str]] = [
+        ("VTI", {"VTI": 1.0}, ""),
+        ("EqualWeightRisk", {t: 1.0 / len(config.risk_tickers) for t in config.risk_tickers}, ""),
+        (
+            "EqualWeightFull",
+            {t: 1.0 / (len(config.risk_tickers) + 1) for t in config.risk_tickers + [config.cash_ticker]},
+            "",
+        ),
+        ("60_40_VTI_TLT", {"VTI": 0.60, "TLT": 0.40}, ""),
+        ("Cash", {config.cash_ticker: 1.0}, ""),
+    ]
+
+    single_asset_scores = []
+    for ticker in returns.columns:
+        equity = _benchmark_equity(returns, {ticker: 1.0})
+        if equity is None:
+            continue
+        stats = _stats_from_equity(equity, daily_rf=daily_rf)
+        score = _safe_float(float(stats.get("Sharpe_Excess", np.nan)), default=-1e9)
+        single_asset_scores.append((score, ticker))
+
+    if single_asset_scores:
+        _score, ticker = max(single_asset_scores, key=lambda x: x[0])
+        specs.append((f"BestSingleAssetHindsight_{ticker}", {ticker: 1.0}, "DIAGNOSTIC_ONLY"))
+
+    return specs
+
+
 def _benchmark_table(
     prices: pd.DataFrame,
     config: MatvmConfig,
     daily_rf: pd.Series,
 ) -> pd.DataFrame:
-    benchmarks: List[Tuple[str, Dict[str, float]]] = [
-        ("VTI buy_hold", {"VTI": 1.0}),
-        ("60_40 VTI_TLT", {"VTI": 0.60, "TLT": 0.40}),
-        ("equal_weight_risk_universe", {t: 1.0 / len(config.risk_tickers) for t in config.risk_tickers}),
-    ]
-
-    rets = simple_returns(prices)
+    returns = _benchmark_return_frame(prices, config)
     rows = []
-    for label, weights in benchmarks:
-        active = {t: w for t, w in weights.items() if t in rets.columns}
-        if not active:
+    for label, weights, note in _benchmark_specs(prices, config, daily_rf):
+        equity = _benchmark_equity(returns, weights)
+        if equity is None:
             rows.append(
                 {
                     "Label": label,
+                    "BenchmarkNote": note,
                     "Status": "NO_DATA",
                     "ActualStart": None,
                     "ActualEnd": None,
@@ -1118,10 +1213,6 @@ def _benchmark_table(
             )
             continue
 
-        w = pd.Series(active, dtype=float)
-        w = w / w.sum()
-        bench_daily = (rets[w.index] * w).sum(axis=1)
-        equity = (1.0 + bench_daily).cumprod()
         rows.append(
             _period_stats_row(
                 label=label,
@@ -1129,9 +1220,78 @@ def _benchmark_table(
                 requested_end=None,
                 equity=equity,
                 daily_rf=daily_rf,
+                extra={"BenchmarkNote": note},
             )
         )
     return pd.DataFrame(rows).sort_values("Sharpe_Excess", ascending=False, na_position="last")
+
+
+def _active_benchmark_table(
+    baseline: BacktestResult,
+    prices: pd.DataFrame,
+    config: MatvmConfig,
+    daily_rf: pd.Series,
+) -> pd.DataFrame:
+    returns = _benchmark_return_frame(prices, config)
+    rows = []
+    strategy_turnover = float(baseline.stats.get("AvgWeeklyTurnover", 0.0))
+
+    for label, weights, note in _benchmark_specs(prices, config, daily_rf):
+        benchmark_equity = _benchmark_equity(returns, weights)
+        if benchmark_equity is None:
+            rows.append({"Benchmark": label, "BenchmarkNote": note, "Status": "NO_DATA"})
+            continue
+
+        idx = baseline.equity_curve.index.intersection(benchmark_equity.index)
+        if len(idx) < 2:
+            rows.append(
+                {
+                    "Benchmark": label,
+                    "BenchmarkNote": note,
+                    "Status": "NO_DATA",
+                    "ActualStart": None,
+                    "ActualEnd": None,
+                    "Days": int(len(idx)),
+                }
+            )
+            continue
+
+        strategy_equity = baseline.equity_curve.loc[idx]
+        benchmark_equity = benchmark_equity.loc[idx]
+        rf = daily_rf.reindex(idx).fillna(0.0)
+
+        strategy_stats = _stats_from_equity(strategy_equity, daily_rf=rf)
+        benchmark_stats = _stats_from_equity(benchmark_equity, daily_rf=rf)
+
+        benchmark_turnover = 0.0
+        row = {
+            "Benchmark": label,
+            "BenchmarkNote": note,
+            "Status": "OK",
+            "ActualStart": str(idx[0].date()),
+            "ActualEnd": str(idx[-1].date()),
+            "Days": int(len(idx)),
+            "Strategy_CAGR": strategy_stats.get("CAGR"),
+            "Benchmark_CAGR": benchmark_stats.get("CAGR"),
+            "Active_CAGR": strategy_stats.get("CAGR") - benchmark_stats.get("CAGR"),
+            "Strategy_MaxDD": strategy_stats.get("MaxDrawdown"),
+            "Benchmark_MaxDD": benchmark_stats.get("MaxDrawdown"),
+            "Drawdown_Reduction": benchmark_stats.get("MaxDrawdown")
+            - strategy_stats.get("MaxDrawdown"),
+            "Strategy_Sharpe_Excess": strategy_stats.get("Sharpe_Excess"),
+            "Benchmark_Sharpe_Excess": benchmark_stats.get("Sharpe_Excess"),
+            "Active_Sharpe_Excess": strategy_stats.get("Sharpe_Excess")
+            - benchmark_stats.get("Sharpe_Excess"),
+            "Strategy_Calmar": strategy_stats.get("Calmar"),
+            "Benchmark_Calmar": benchmark_stats.get("Calmar"),
+            "Active_Calmar": strategy_stats.get("Calmar") - benchmark_stats.get("Calmar"),
+            "Strategy_AvgWeeklyTurnover": strategy_turnover,
+            "Benchmark_AvgWeeklyTurnover": benchmark_turnover,
+            "Turnover_Delta": strategy_turnover - benchmark_turnover,
+        }
+        rows.append(row)
+
+    return pd.DataFrame(rows).sort_values("Active_Sharpe_Excess", ascending=False, na_position="last")
 
 
 def _walk_forward_table(
@@ -1202,6 +1362,8 @@ def run_robustness_analysis(
     start_dates: Sequence[str],
     outdir: Path,
     score_metric: str = "Sharpe_Excess",
+    backtest_status: str = "UNKNOWN",
+    data_audit_status: str = "UNKNOWN",
 ) -> Dict[str, pd.DataFrame]:
     prices = _ensure_datetime_index(prices).sort_index()
     required = config.required_price_tickers()
@@ -1237,6 +1399,12 @@ def run_robustness_analysis(
             config=config,
             daily_rf=daily_rf,
         ),
+        "active_benchmarks": _active_benchmark_table(
+            baseline=baseline,
+            prices=prices,
+            config=config,
+            daily_rf=daily_rf,
+        ),
         "walk_forward": _walk_forward_table(
             results=variant_results,
             prices=prices,
@@ -1244,6 +1412,15 @@ def run_robustness_analysis(
             score_metric=score_metric,
         ),
     }
+
+    git_commit = _git_commit()
+    metadata = _run_metadata_columns(
+        config=config,
+        backtest_status=backtest_status,
+        data_audit_status=data_audit_status,
+        git_commit=git_commit,
+    )
+    tables = {name: _add_run_metadata(df, metadata) for name, df in tables.items()}
 
     outdir.mkdir(parents=True, exist_ok=True)
     for name, df in tables.items():
@@ -1259,6 +1436,9 @@ def run_robustness_analysis(
         "cash_return_mode": config.cash_return_mode,
         "cash_return_ticker": config.cash_return_ticker,
         "annual_cash_return_rate": config.annual_cash_return_rate,
+        "backtest_status": backtest_status,
+        "data_audit_status": data_audit_status,
+        "git_commit": git_commit,
         "score_metric": score_metric,
         "tables": {name: f"robustness_{name}.csv" for name in tables},
     }
@@ -1918,6 +2098,8 @@ def cli_robustness(args: argparse.Namespace) -> None:
 
     start_dates = _parse_date_list(args.start_dates)
     outdir = Path(args.outdir)
+    backtest_status = "DIAGNOSTIC ONLY" if audit.has_issues() else "CLEAN DATA CHECK PASSED"
+    data_audit_status = "WARNINGS" if audit.warnings else "CLEAN"
     tables = run_robustness_analysis(
         prices=prices,
         config=cfg,
@@ -1925,6 +2107,8 @@ def cli_robustness(args: argparse.Namespace) -> None:
         start_dates=start_dates,
         outdir=outdir,
         score_metric=args.score_metric,
+        backtest_status=backtest_status,
+        data_audit_status=data_audit_status,
     )
 
     print("\n=== Robustness status ===")
@@ -1967,6 +2151,26 @@ def cli_robustness(args: argparse.Namespace) -> None:
 
     print("\n=== Benchmarks ===")
     print(tables["benchmarks"][[c for c in display_cols if c in tables["benchmarks"].columns]].to_string(index=False))
+
+    active_cols = [
+        "Benchmark",
+        "BenchmarkNote",
+        "Status",
+        "Strategy_CAGR",
+        "Benchmark_CAGR",
+        "Active_CAGR",
+        "Strategy_MaxDD",
+        "Benchmark_MaxDD",
+        "Drawdown_Reduction",
+        "Strategy_Sharpe_Excess",
+        "Benchmark_Sharpe_Excess",
+        "Active_Sharpe_Excess",
+        "Strategy_Calmar",
+        "Benchmark_Calmar",
+        "Turnover_Delta",
+    ]
+    print("\n=== Active benchmark comparison ===")
+    print(tables["active_benchmarks"][[c for c in active_cols if c in tables["active_benchmarks"].columns]].to_string(index=False))
 
     if not tables["walk_forward"].empty:
         wf_cols = [
