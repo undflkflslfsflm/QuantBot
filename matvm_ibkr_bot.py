@@ -34,6 +34,16 @@ CASH_RETURN_MODES = {"zero", "constant", "ticker"}
 MIN_DAILY_RETURN_STD = 1e-5
 DECISION_MIN_EXCESS_SHARPE = 0.50
 DECISION_MATERIAL_DD_REDUCTION = 0.08
+VOL_TARGET_BENCHMARKS = (0.08, 0.10, 0.12)
+VOL_TARGET_LOOKBACK_DAYS = 63
+DIAGNOSTIC_OUTPUT_TABLES = {
+    "allocation_history",
+    "asset_weight_summary",
+    "cash_exposure_summary",
+    "return_contribution_by_asset",
+    "best_allocation_decisions",
+    "worst_allocation_decisions",
+}
 
 
 def _dt_utc_now() -> datetime:
@@ -1106,6 +1116,7 @@ def _classify_strategy(summary: Dict[str, object]) -> Tuple[str, List[str]]:
     strategy_sharpe = _metric_value(summary.get("Strategy_Sharpe_Excess"))
     ew_sharpe_delta = _metric_value(summary.get("EqualWeightRisk_Sharpe_Delta"))
     ew_dd_reduction = _metric_value(summary.get("EqualWeightRisk_Drawdown_Reduction"))
+    vol_target_sharpe_delta = _metric_value(summary.get("BestVolTarget_Sharpe_Delta"))
 
     if negative_folds > 0:
         reasons.append("At least one walk-forward fold has negative excess Sharpe")
@@ -1117,6 +1128,8 @@ def _classify_strategy(summary: Dict[str, object]) -> Tuple[str, List[str]]:
         )
     if ew_sharpe_delta is not None and ew_sharpe_delta < 0:
         reasons.append("Strategy underperforms EqualWeightRisk on excess Sharpe")
+    if vol_target_sharpe_delta is not None and vol_target_sharpe_delta < 0:
+        reasons.append("Strategy underperforms best VolTarget VTI/cash benchmark on excess Sharpe")
     if ew_dd_reduction is not None and ew_dd_reduction >= DECISION_MATERIAL_DD_REDUCTION:
         reasons.append("Strategy materially reduces drawdown versus EqualWeightRisk")
 
@@ -1203,6 +1216,35 @@ def _robustness_decision_summary(
             }
         )
 
+    vol_rows = active[
+        active.get("Benchmark", pd.Series(dtype=str)).astype(str).str.startswith("VolTarget_VTI_Cash_")
+        & (active.get("Status", "") == "OK")
+    ].copy()
+    if not vol_rows.empty:
+        vol_rows["Benchmark_Sharpe_Excess"] = pd.to_numeric(
+            vol_rows["Benchmark_Sharpe_Excess"], errors="coerce"
+        )
+        vol_rows = vol_rows.dropna(subset=["Benchmark_Sharpe_Excess"])
+    if not vol_rows.empty:
+        best_vol = vol_rows.loc[vol_rows["Benchmark_Sharpe_Excess"].idxmax()]
+        summary.update(
+            {
+                "BestVolTargetBenchmark": best_vol.get("Benchmark"),
+                "BestVolTarget_CAGR_Delta": best_vol.get("Active_CAGR"),
+                "BestVolTarget_Sharpe_Delta": best_vol.get("Active_Sharpe_Excess"),
+                "BestVolTarget_Drawdown_Reduction": best_vol.get("Drawdown_Reduction"),
+            }
+        )
+    else:
+        summary.update(
+            {
+                "BestVolTargetBenchmark": None,
+                "BestVolTarget_CAGR_Delta": None,
+                "BestVolTarget_Sharpe_Delta": None,
+                "BestVolTarget_Drawdown_Reduction": None,
+            }
+        )
+
     decision, reasons = _classify_strategy(summary)
     summary["Decision"] = decision
     summary["Reason"] = reasons
@@ -1236,6 +1278,13 @@ def _write_summary_markdown(outdir: Path, summary: Dict[str, object]) -> None:
         f"- Active CAGR: {_fmt_metric(summary.get('EqualWeightRisk_CAGR_Delta'), pct=True)}",
         f"- Active excess Sharpe: {_fmt_metric(summary.get('EqualWeightRisk_Sharpe_Delta'))}",
         f"- Drawdown reduction: {_fmt_metric(summary.get('EqualWeightRisk_Drawdown_Reduction'), pct=True)}",
+        "",
+        "## VolTarget VTI/Cash Comparison",
+        "",
+        f"- Best VolTarget benchmark: {summary.get('BestVolTargetBenchmark')}",
+        f"- Active CAGR: {_fmt_metric(summary.get('BestVolTarget_CAGR_Delta'), pct=True)}",
+        f"- Active excess Sharpe: {_fmt_metric(summary.get('BestVolTarget_Sharpe_Delta'))}",
+        f"- Drawdown reduction: {_fmt_metric(summary.get('BestVolTarget_Drawdown_Reduction'), pct=True)}",
         "",
         "## Benchmarks",
         "",
@@ -1381,15 +1430,92 @@ def _benchmark_return_frame(prices: pd.DataFrame, config: MatvmConfig) -> pd.Dat
     return out
 
 
-def _benchmark_equity(returns: pd.DataFrame, weights: Dict[str, float]) -> Optional[pd.Series]:
+def _benchmark_daily_returns(returns: pd.DataFrame, weights: Dict[str, float]) -> Optional[pd.Series]:
     active = {t: w for t, w in weights.items() if t in returns.columns}
     if not active:
         return None
 
     w = pd.Series(active, dtype=float)
     w = w / w.sum()
-    bench_daily = (returns[w.index] * w).sum(axis=1)
+    return (returns[w.index] * w).sum(axis=1)
+
+
+def _benchmark_equity(returns: pd.DataFrame, weights: Dict[str, float]) -> Optional[pd.Series]:
+    bench_daily = _benchmark_daily_returns(returns, weights)
+    if bench_daily is None:
+        return None
     return (1.0 + bench_daily).cumprod()
+
+
+def _vol_target_vti_cash_benchmark(
+    returns: pd.DataFrame,
+    config: MatvmConfig,
+    target_vol: float,
+    lookback_days: int = VOL_TARGET_LOOKBACK_DAYS,
+) -> Tuple[Optional[pd.Series], Optional[pd.DataFrame], float]:
+    if "VTI" not in returns.columns or config.cash_ticker not in returns.columns:
+        return None, None, 0.0
+
+    idx = returns.index
+    if len(idx) < 2:
+        return None, None, 0.0
+
+    signal_dates = pd.DatetimeIndex(
+        idx.to_series().resample(config.rebalance_freq).last().dropna().values
+    )
+    signal_set = set(signal_dates)
+
+    w_current = pd.Series({"VTI": 0.0, config.cash_ticker: 1.0}, dtype=float)
+    pending_target: Optional[pd.Series] = None
+    pending_trade_date: Optional[pd.Timestamp] = None
+
+    equity = []
+    weights = []
+    trade_turnover: List[float] = []
+    value = 1.0
+    vti_rets = returns["VTI"].fillna(0.0)
+    cash_rets = returns[config.cash_ticker].fillna(0.0)
+
+    for i, dt in enumerate(idx):
+        if i > 0:
+            daily_return = (
+                float(w_current.get("VTI", 0.0)) * float(vti_rets.loc[dt])
+                + float(w_current.get(config.cash_ticker, 0.0)) * float(cash_rets.loc[dt])
+            )
+            value *= 1.0 + daily_return
+
+        if pending_trade_date is not None and dt == pending_trade_date and pending_target is not None:
+            turnover = 0.5 * float((pending_target - w_current).abs().sum())
+            trade_turnover.append(turnover)
+            w_current = pending_target.copy()
+            pending_target = None
+            pending_trade_date = None
+
+        if dt in signal_set:
+            trailing = vti_rets.loc[:dt].tail(lookback_days)
+            if len(trailing) >= lookback_days:
+                realized_vol = float(trailing.std(ddof=0) * math.sqrt(TRADING_DAYS_PER_YEAR))
+                if realized_vol > 0.0 and not np.isnan(realized_vol):
+                    vti_weight = min(max(target_vol / realized_vol, 0.0), 1.0)
+                else:
+                    vti_weight = 0.0
+            else:
+                vti_weight = 0.0
+
+            pending_target = pd.Series(
+                {"VTI": float(vti_weight), config.cash_ticker: 1.0 - float(vti_weight)},
+                dtype=float,
+            )
+            if i + 1 < len(idx):
+                pending_trade_date = idx[i + 1]
+
+        equity.append(value)
+        weights.append(w_current.copy())
+
+    equity_series = pd.Series(equity, index=idx, name=f"VolTarget_VTI_Cash_{int(target_vol * 100)}pct")
+    weights_df = pd.DataFrame(weights, index=idx).fillna(0.0)
+    avg_turnover = float(np.mean(trade_turnover)) if trade_turnover else 0.0
+    return equity_series, weights_df, avg_turnover
 
 
 def _benchmark_specs(
@@ -1426,15 +1552,53 @@ def _benchmark_specs(
     return specs
 
 
+def _benchmark_results(
+    prices: pd.DataFrame,
+    config: MatvmConfig,
+    daily_rf: pd.Series,
+) -> List[Dict[str, object]]:
+    returns = _benchmark_return_frame(prices, config)
+    results: List[Dict[str, object]] = []
+
+    for label, weights, note in _benchmark_specs(prices, config, daily_rf):
+        results.append(
+            {
+                "label": label,
+                "note": note,
+                "equity": _benchmark_equity(returns, weights),
+                "avg_turnover": 0.0,
+            }
+        )
+
+    for target_vol in VOL_TARGET_BENCHMARKS:
+        equity, weights_df, avg_turnover = _vol_target_vti_cash_benchmark(
+            returns=returns,
+            config=config,
+            target_vol=target_vol,
+        )
+        results.append(
+            {
+                "label": f"VolTarget_VTI_Cash_{int(target_vol * 100)}pct",
+                "note": "",
+                "equity": equity,
+                "weights": weights_df,
+                "avg_turnover": avg_turnover,
+            }
+        )
+
+    return results
+
+
 def _benchmark_table(
     prices: pd.DataFrame,
     config: MatvmConfig,
     daily_rf: pd.Series,
 ) -> pd.DataFrame:
-    returns = _benchmark_return_frame(prices, config)
     rows = []
-    for label, weights, note in _benchmark_specs(prices, config, daily_rf):
-        equity = _benchmark_equity(returns, weights)
+    for result in _benchmark_results(prices, config, daily_rf):
+        label = str(result["label"])
+        note = str(result.get("note") or "")
+        equity = result.get("equity")
         if equity is None:
             rows.append(
                 {
@@ -1455,7 +1619,10 @@ def _benchmark_table(
                 requested_end=None,
                 equity=equity,
                 daily_rf=daily_rf,
-                extra={"BenchmarkNote": note},
+                extra={
+                    "BenchmarkNote": note,
+                    "AvgWeeklyTurnover": float(result.get("avg_turnover") or 0.0),
+                },
             )
         )
     return pd.DataFrame(rows).sort_values("Sharpe_Excess", ascending=False, na_position="last")
@@ -1467,12 +1634,13 @@ def _active_benchmark_table(
     config: MatvmConfig,
     daily_rf: pd.Series,
 ) -> pd.DataFrame:
-    returns = _benchmark_return_frame(prices, config)
     rows = []
     strategy_turnover = float(baseline.stats.get("AvgWeeklyTurnover", 0.0))
 
-    for label, weights, note in _benchmark_specs(prices, config, daily_rf):
-        benchmark_equity = _benchmark_equity(returns, weights)
+    for result in _benchmark_results(prices, config, daily_rf):
+        label = str(result["label"])
+        note = str(result.get("note") or "")
+        benchmark_equity = result.get("equity")
         if benchmark_equity is None:
             rows.append({"Benchmark": label, "BenchmarkNote": note, "Status": "NO_DATA"})
             continue
@@ -1498,7 +1666,7 @@ def _active_benchmark_table(
         strategy_stats = _stats_from_equity(strategy_equity, daily_rf=rf)
         benchmark_stats = _stats_from_equity(benchmark_equity, daily_rf=rf)
 
-        benchmark_turnover = 0.0
+        benchmark_turnover = float(result.get("avg_turnover") or 0.0)
         row = {
             "Benchmark": label,
             "BenchmarkNote": note,
@@ -1527,6 +1695,370 @@ def _active_benchmark_table(
         rows.append(row)
 
     return pd.DataFrame(rows).sort_values("Active_Sharpe_Excess", ascending=False, na_position="last")
+
+
+def _strategy_return_inputs(
+    baseline: BacktestResult,
+    prices: pd.DataFrame,
+    config: MatvmConfig,
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.Series]:
+    returns = _benchmark_return_frame(prices, config).reindex(baseline.weights.index).fillna(0.0)
+    tickers = config.all_tickers()
+    for ticker in tickers:
+        if ticker not in returns.columns:
+            returns[ticker] = 0.0
+
+    weights = baseline.weights.reindex(returns.index).ffill().fillna(0.0)
+    for ticker in tickers:
+        if ticker not in weights.columns:
+            weights[ticker] = 0.0
+
+    returns = returns[tickers]
+    weights = weights[tickers]
+    weights_for_return = weights.shift(1).fillna(0.0)
+    portfolio_returns = baseline.equity_curve.pct_change().reindex(returns.index).fillna(0.0)
+    return returns, weights, weights_for_return, portfolio_returns
+
+
+def _allocation_history_table(
+    baseline: BacktestResult,
+    prices: pd.DataFrame,
+    config: MatvmConfig,
+) -> pd.DataFrame:
+    returns, weights, weights_for_return, portfolio_returns = _strategy_return_inputs(
+        baseline=baseline,
+        prices=prices,
+        config=config,
+    )
+    rows = []
+    for ticker in config.all_tickers():
+        contribution = weights_for_return[ticker] * returns[ticker]
+        frame = pd.DataFrame(
+            {
+                "Date": returns.index,
+                "Ticker": ticker,
+                "Weight": weights_for_return[ticker].values,
+                "EndOfDayWeight": weights[ticker].values,
+                "IsCash": ticker == config.cash_ticker,
+                "PortfolioReturn": portfolio_returns.values,
+                "AssetReturn": returns[ticker].values,
+                "Contribution": contribution.values,
+            }
+        )
+        rows.append(frame)
+    return pd.concat(rows, ignore_index=True)
+
+
+def _asset_weight_summary_table(
+    baseline: BacktestResult,
+    prices: pd.DataFrame,
+    config: MatvmConfig,
+) -> pd.DataFrame:
+    returns, weights, weights_for_return, _portfolio_returns = _strategy_return_inputs(
+        baseline=baseline,
+        prices=prices,
+        config=config,
+    )
+
+    rows = []
+    for ticker in config.all_tickers():
+        held = weights_for_return[ticker] > 1e-6
+        rows.append(
+            {
+                "Ticker": ticker,
+                "IsCash": ticker == config.cash_ticker,
+                "AverageWeight": float(weights[ticker].mean()),
+                "MedianWeight": float(weights[ticker].median()),
+                "MaxWeight": float(weights[ticker].max()),
+                "PercentDaysHeld": float((weights[ticker] > 1e-6).mean()),
+                "AverageAppliedWeight": float(weights_for_return[ticker].mean()),
+                "AvgReturnWhenHeld": float(returns.loc[held, ticker].mean()) if held.any() else np.nan,
+                "HitRateWhenHeld": float((returns.loc[held, ticker] > 0.0).mean()) if held.any() else np.nan,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def _cash_exposure_summary_table(
+    baseline: BacktestResult,
+    prices: pd.DataFrame,
+    config: MatvmConfig,
+) -> pd.DataFrame:
+    _returns, weights, _weights_for_return, _portfolio_returns = _strategy_return_inputs(
+        baseline=baseline,
+        prices=prices,
+        config=config,
+    )
+
+    cash_weight = weights[config.cash_ticker]
+    risk_weight = weights[config.risk_tickers].sum(axis=1)
+    changes = weights.diff().abs().fillna(0.0)
+    cash_turnover = 0.5 * float(changes[config.cash_ticker].sum())
+    risk_turnover = 0.5 * float(changes[config.risk_tickers].sum(axis=1).sum())
+
+    row = {
+        "ActualStart": str(weights.index[0].date()) if len(weights.index) else None,
+        "ActualEnd": str(weights.index[-1].date()) if len(weights.index) else None,
+        "CashTicker": config.cash_ticker,
+        "Percent_Time_In_Cash": float((cash_weight > 1e-6).mean()),
+        "Percent_Majority_Cash": float((cash_weight >= 0.5).mean()),
+        "Average_Cash_Weight": float(cash_weight.mean()),
+        "Median_Cash_Weight": float(cash_weight.median()),
+        "Max_Cash_Weight": float(cash_weight.max()),
+        "Average_Risk_Asset_Weight": float(risk_weight.mean()),
+        "Median_Risk_Asset_Weight": float(risk_weight.median()),
+        "Turnover_From_Cash": cash_turnover,
+        "Turnover_From_Risk_Assets": risk_turnover,
+    }
+    return pd.DataFrame([row])
+
+
+def _return_contribution_by_asset_table(
+    baseline: BacktestResult,
+    prices: pd.DataFrame,
+    config: MatvmConfig,
+) -> pd.DataFrame:
+    returns, weights, weights_for_return, _portfolio_returns = _strategy_return_inputs(
+        baseline=baseline,
+        prices=prices,
+        config=config,
+    )
+    contributions = weights_for_return * returns
+    total_contribution = float(contributions.sum().sum())
+
+    rows = []
+    for ticker in config.all_tickers():
+        held = weights_for_return[ticker] > 1e-6
+        contribution = contributions[ticker]
+        rows.append(
+            {
+                "Ticker": ticker,
+                "IsCash": ticker == config.cash_ticker,
+                "AverageWeight": float(weights[ticker].mean()),
+                "ReturnContribution": float(contribution.sum()),
+                "ContributionShare": (
+                    float(contribution.sum() / total_contribution)
+                    if abs(total_contribution) > 1e-12
+                    else np.nan
+                ),
+                "AvgReturnWhenHeld": float(returns.loc[held, ticker].mean()) if held.any() else np.nan,
+                "HitRateWhenHeld": float((returns.loc[held, ticker] > 0.0).mean()) if held.any() else np.nan,
+                "WorstContribution": float(contribution.min()),
+                "BestContribution": float(contribution.max()),
+            }
+        )
+    return pd.DataFrame(rows).sort_values("ReturnContribution", ascending=False)
+
+
+def _allocation_decision_reason(
+    benchmark: str,
+    selected_assets: str,
+    cash_weight: float,
+    portfolio_return: float,
+    benchmark_return: float,
+    active_return: float,
+) -> str:
+    if cash_weight >= 0.5 and benchmark_return > portfolio_return:
+        return f"Cash drag versus {benchmark}"
+    if cash_weight >= 0.5 and benchmark_return < 0.0 and active_return > 0.0:
+        return f"Defensive cash allocation helped versus {benchmark}"
+    if not selected_assets:
+        return "Cash-only allocation"
+    if active_return > 0.0:
+        return f"Selected risk assets beat {benchmark}"
+    return f"Selected risk assets lagged {benchmark}"
+
+
+def _allocation_decision_tables(
+    baseline: BacktestResult,
+    prices: pd.DataFrame,
+    config: MatvmConfig,
+    top_n: int = 10,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    returns, weights, _weights_for_return, portfolio_returns = _strategy_return_inputs(
+        baseline=baseline,
+        prices=prices,
+        config=config,
+    )
+    benchmark_specs = [
+        ("EqualWeightRisk", {t: 1.0 / len(config.risk_tickers) for t in config.risk_tickers}),
+        ("VTI", {"VTI": 1.0}),
+    ]
+
+    rows = []
+    strategy_weekly = (1.0 + portfolio_returns).resample("W-FRI").prod() - 1.0
+    weekly_cash_weight = weights[config.cash_ticker].resample("W-FRI").mean()
+    weekly_last_weights = weights.resample("W-FRI").last()
+
+    for benchmark, benchmark_weights in benchmark_specs:
+        benchmark_daily = _benchmark_daily_returns(returns, benchmark_weights)
+        if benchmark_daily is None:
+            continue
+        benchmark_weekly = (1.0 + benchmark_daily).resample("W-FRI").prod() - 1.0
+        idx = strategy_weekly.index.intersection(benchmark_weekly.index).intersection(weekly_last_weights.index)
+        for dt in idx:
+            row_weights = weekly_last_weights.loc[dt]
+            selected_assets = [
+                ticker for ticker in config.risk_tickers if float(row_weights.get(ticker, 0.0)) > 1e-4
+            ]
+            selected = ",".join(selected_assets)
+            portfolio_return = float(strategy_weekly.loc[dt])
+            benchmark_return = float(benchmark_weekly.loc[dt])
+            active_return = portfolio_return - benchmark_return
+            cash_weight = float(weekly_cash_weight.loc[dt])
+            rows.append(
+                {
+                    "Date": dt,
+                    "Benchmark": benchmark,
+                    "SelectedAssets": selected,
+                    "CashWeight": cash_weight,
+                    "PortfolioReturn": portfolio_return,
+                    "BenchmarkReturn": benchmark_return,
+                    "ActiveReturn": active_return,
+                    "Reason": _allocation_decision_reason(
+                        benchmark=benchmark,
+                        selected_assets=selected,
+                        cash_weight=cash_weight,
+                        portfolio_return=portfolio_return,
+                        benchmark_return=benchmark_return,
+                        active_return=active_return,
+                    ),
+                }
+            )
+
+    columns = [
+        "Date",
+        "Benchmark",
+        "SelectedAssets",
+        "CashWeight",
+        "PortfolioReturn",
+        "BenchmarkReturn",
+        "ActiveReturn",
+        "Reason",
+    ]
+    decisions = pd.DataFrame(rows, columns=columns)
+    if decisions.empty:
+        return decisions.copy(), decisions.copy()
+
+    worst = decisions.sort_values("ActiveReturn", ascending=True).head(top_n).reset_index(drop=True)
+    best = decisions.sort_values("ActiveReturn", ascending=False).head(top_n).reset_index(drop=True)
+    return best, worst
+
+
+def _allocation_diagnostic_tables(
+    baseline: BacktestResult,
+    prices: pd.DataFrame,
+    config: MatvmConfig,
+) -> Dict[str, pd.DataFrame]:
+    best, worst = _allocation_decision_tables(
+        baseline=baseline,
+        prices=prices,
+        config=config,
+    )
+    return {
+        "allocation_history": _allocation_history_table(
+            baseline=baseline,
+            prices=prices,
+            config=config,
+        ),
+        "asset_weight_summary": _asset_weight_summary_table(
+            baseline=baseline,
+            prices=prices,
+            config=config,
+        ),
+        "cash_exposure_summary": _cash_exposure_summary_table(
+            baseline=baseline,
+            prices=prices,
+            config=config,
+        ),
+        "return_contribution_by_asset": _return_contribution_by_asset_table(
+            baseline=baseline,
+            prices=prices,
+            config=config,
+        ),
+        "best_allocation_decisions": best,
+        "worst_allocation_decisions": worst,
+    }
+
+
+def _robustness_table_filename(name: str) -> str:
+    if name in DIAGNOSTIC_OUTPUT_TABLES:
+        return f"{name}.csv"
+    return f"robustness_{name}.csv"
+
+
+def _plot_defensive_benchmark_charts(
+    baseline: BacktestResult,
+    prices: pd.DataFrame,
+    config: MatvmConfig,
+    daily_rf: pd.Series,
+    outdir: Path,
+) -> List[str]:
+    if not _HAVE_MPL:
+        return []
+
+    benchmark_results = _benchmark_results(prices, config, daily_rf)
+    wanted = {
+        "VTI",
+        "EqualWeightRisk",
+        "VolTarget_VTI_Cash_8pct",
+        "VolTarget_VTI_Cash_10pct",
+        "VolTarget_VTI_Cash_12pct",
+    }
+
+    series: Dict[str, pd.Series] = {
+        "MATVM": baseline.equity_curve / baseline.equity_curve.iloc[0],
+    }
+    for result in benchmark_results:
+        label = str(result["label"])
+        equity = result.get("equity")
+        if label in wanted and isinstance(equity, pd.Series) and len(equity) > 1:
+            series[label] = equity / equity.iloc[0]
+
+    if len(series) < 2:
+        return []
+
+    common_index = series["MATVM"].index
+    for values in series.values():
+        common_index = common_index.intersection(values.index)
+    if len(common_index) < 2:
+        return []
+
+    paths: List[str] = []
+
+    fig = plt.figure(figsize=(11, 6))
+    ax = fig.add_subplot(1, 1, 1)
+    for label, values in series.items():
+        values.loc[common_index].plot(ax=ax, label=label)
+    ax.set_title("Equity Curve vs Benchmarks")
+    ax.set_xlabel("")
+    ax.set_ylabel("Growth of $1")
+    ax.legend(loc="best")
+    ax.grid(True, alpha=0.25)
+    fig.tight_layout()
+    equity_path = outdir / "equity_curve_vs_benchmarks.png"
+    fig.savefig(equity_path, dpi=150)
+    plt.close(fig)
+    paths.append(equity_path.name)
+
+    fig = plt.figure(figsize=(11, 6))
+    ax = fig.add_subplot(1, 1, 1)
+    for label, values in series.items():
+        aligned = values.loc[common_index]
+        drawdown = 1.0 - aligned / aligned.cummax()
+        drawdown.plot(ax=ax, label=label)
+    ax.set_title("Drawdown vs Benchmarks")
+    ax.set_xlabel("")
+    ax.set_ylabel("Drawdown")
+    ax.legend(loc="best")
+    ax.grid(True, alpha=0.25)
+    fig.tight_layout()
+    drawdown_path = outdir / "drawdown_vs_benchmarks.png"
+    fig.savefig(drawdown_path, dpi=150)
+    plt.close(fig)
+    paths.append(drawdown_path.name)
+
+    return paths
 
 
 def _walk_forward_table(
@@ -1647,6 +2179,13 @@ def run_robustness_analysis(
             score_metric=score_metric,
         ),
     }
+    tables.update(
+        _allocation_diagnostic_tables(
+            baseline=baseline,
+            prices=prices,
+            config=config,
+        )
+    )
 
     git_commit = _git_commit()
     metadata = _run_metadata_columns(
@@ -1667,12 +2206,20 @@ def run_robustness_analysis(
 
     outdir.mkdir(parents=True, exist_ok=True)
     for name, df in tables.items():
-        df.to_csv(outdir / f"robustness_{name}.csv", index=False, lineterminator="\n")
+        df.to_csv(outdir / _robustness_table_filename(name), index=False, lineterminator="\n")
+    plot_files = _plot_defensive_benchmark_charts(
+        baseline=baseline,
+        prices=prices,
+        config=config,
+        daily_rf=daily_rf,
+        outdir=outdir,
+    )
 
     summary = {
         "run_at_utc": _dt_utc_now().isoformat(),
         "score_metric": score_metric,
-        "tables": {name: f"robustness_{name}.csv" for name in tables},
+        "tables": {name: _robustness_table_filename(name) for name in tables},
+        "plots": plot_files,
     }
     summary.update(decision_summary)
     (outdir / "robustness_summary.json").write_text(
@@ -2369,10 +2916,40 @@ def cli_robustness(args: argparse.Namespace) -> None:
     print(f"{'Strategy excess Sharpe':>22}: {_fmt_metric(summary.get('Strategy_Sharpe_Excess'))}")
     print(f"{'EW Risk Sharpe delta':>22}: {_fmt_metric(summary.get('EqualWeightRisk_Sharpe_Delta'))}")
     print(f"{'EW Risk DD reduction':>22}: {_fmt_metric(summary.get('EqualWeightRisk_Drawdown_Reduction'), pct=True)}")
+    print(f"{'Best VolTarget':>22}: {summary.get('BestVolTargetBenchmark')}")
+    print(f"{'VolTarget Sharpe delta':>22}: {_fmt_metric(summary.get('BestVolTarget_Sharpe_Delta'))}")
+    print(f"{'VolTarget DD reduction':>22}: {_fmt_metric(summary.get('BestVolTarget_Drawdown_Reduction'), pct=True)}")
     print(f"{'WF negative folds':>22}: {summary.get('WalkForwardNegativeFoldCount')}")
     reasons = summary.get("Reason") or []
     if reasons:
         print(f"{'Primary reason':>22}: {reasons[0]}")
+
+    exposure_cols = [
+        "Percent_Time_In_Cash",
+        "Average_Cash_Weight",
+        "Median_Cash_Weight",
+        "Max_Cash_Weight",
+        "Average_Risk_Asset_Weight",
+        "Turnover_From_Cash",
+        "Turnover_From_Risk_Assets",
+    ]
+    print("\n=== Allocation exposure summary ===")
+    exposure = tables["cash_exposure_summary"]
+    print(exposure[[c for c in exposure_cols if c in exposure.columns]].to_string(index=False))
+
+    contribution_cols = [
+        "Ticker",
+        "AverageWeight",
+        "ReturnContribution",
+        "ContributionShare",
+        "AvgReturnWhenHeld",
+        "HitRateWhenHeld",
+        "WorstContribution",
+        "BestContribution",
+    ]
+    print("\n=== Return contribution by asset ===")
+    contrib = tables["return_contribution_by_asset"]
+    print(contrib[[c for c in contribution_cols if c in contrib.columns]].to_string(index=False))
 
     display_cols = [
         "Label",
