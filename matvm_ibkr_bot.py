@@ -28,6 +28,7 @@ except Exception:
 # -----------------------------
 
 TRADING_DAYS_PER_YEAR = 252
+RISK_FREE_MODES = {"zero", "constant", "ticker"}
 
 
 def _dt_utc_now() -> datetime:
@@ -119,6 +120,20 @@ def _safe_float(x: float, default: float = 0.0) -> float:
         return default
 
 
+def _price_cagr(prices: pd.Series) -> float:
+    prices = prices.dropna()
+    if len(prices) < 2:
+        return 0.0
+    start = prices.index[0]
+    end = prices.index[-1]
+    if isinstance(start, pd.Timestamp) and isinstance(end, pd.Timestamp):
+        years = (end - start).days / 365.25
+        if years > 0:
+            return float((prices.iloc[-1] / prices.iloc[0]) ** (1 / years) - 1)
+    periods = max(len(prices) - 1, 1)
+    return float((prices.iloc[-1] / prices.iloc[0]) ** (TRADING_DAYS_PER_YEAR / periods) - 1)
+
+
 # -----------------------------
 # Config and State
 # -----------------------------
@@ -131,6 +146,12 @@ class MatvmConfig:
         default_factory=lambda: ["VTI", "VXUS", "TLT", "IAU", "PDBC"]
     )
     cash_ticker: str = "SGOV"  # fallback: "BIL" for longer history
+
+    # Performance benchmark. This is intentionally separate from cash_ticker:
+    # cash_ticker is investable, risk_free_* controls excess-return metrics.
+    risk_free_mode: str = "zero"  # "zero", "constant", or "ticker"
+    risk_free_ticker: Optional[str] = None
+    annual_risk_free_rate: float = 0.0
 
     # Signal windows (trading days)
     vol_window: int = 60
@@ -163,6 +184,12 @@ class MatvmConfig:
 
     def all_tickers(self) -> List[str]:
         return list(dict.fromkeys(self.risk_tickers + [self.cash_ticker]))
+
+    def required_price_tickers(self) -> List[str]:
+        tickers = self.all_tickers()
+        if str(self.risk_free_mode).strip().lower() == "ticker" and self.risk_free_ticker:
+            tickers.append(self.risk_free_ticker)
+        return list(dict.fromkeys(tickers))
 
 
 @dataclass
@@ -477,6 +504,136 @@ class MatvmStrategy:
 
 
 @dataclass
+class DataAuditResult:
+    warnings: List[str] = field(default_factory=list)
+    errors: List[str] = field(default_factory=list)
+
+    def has_issues(self) -> bool:
+        return bool(self.warnings or self.errors)
+
+
+def get_daily_rf(rets: pd.DataFrame, config: MatvmConfig) -> pd.Series:
+    """Build the benchmark return series for excess-return metrics."""
+    mode = str(config.risk_free_mode).strip().lower()
+    if mode not in RISK_FREE_MODES:
+        raise ValueError(f"Unknown risk_free_mode: {config.risk_free_mode}")
+
+    if mode == "zero":
+        return pd.Series(0.0, index=rets.index, name="RF_ZERO")
+
+    if mode == "constant":
+        annual = float(config.annual_risk_free_rate)
+        if annual <= -1.0:
+            raise ValueError("annual_risk_free_rate must be greater than -1.0")
+        daily = (1.0 + annual) ** (1.0 / TRADING_DAYS_PER_YEAR) - 1.0
+        return pd.Series(daily, index=rets.index, name="RF_CONSTANT")
+
+    if not config.risk_free_ticker:
+        raise ValueError("risk_free_ticker must be set when risk_free_mode='ticker'")
+    if config.risk_free_ticker not in rets.columns:
+        raise ValueError(f"Missing risk-free ticker: {config.risk_free_ticker}")
+    return rets[config.risk_free_ticker].rename(f"RF_{config.risk_free_ticker}")
+
+
+def _looks_like_make_fake_data(prices: pd.Series) -> bool:
+    clean = prices.dropna()
+    if len(clean) < 3000:
+        return False
+    idx = pd.DatetimeIndex(clean.index)
+    if idx[0] != pd.Timestamp("2014-01-01"):
+        return False
+    if pd.Timestamp("2025-12-31") not in idx:
+        return False
+    if not 95.0 <= float(clean.iloc[0]) <= 105.0:
+        return False
+
+    synthetic_calendar = pd.date_range("2014-01-01", "2025-12-31", freq="B")
+    return synthetic_calendar.isin(idx).all()
+
+
+def audit_cash_proxy(prices: pd.Series, ticker: str) -> List[str]:
+    warnings: List[str] = []
+    clean = prices.dropna()
+    if len(clean) < 2:
+        return [f"{ticker}: no return data"]
+
+    rets = clean.pct_change().replace([np.inf, -np.inf], np.nan).dropna()
+    if rets.empty:
+        return [f"{ticker}: no return data"]
+
+    ann_vol = float(rets.std(ddof=0) * math.sqrt(TRADING_DAYS_PER_YEAR))
+    cagr_val = _price_cagr(clean)
+    max_daily_abs = float(rets.abs().max())
+
+    if ann_vol > 0.03:
+        warnings.append(f"{ticker}: suspicious cash-proxy volatility: {ann_vol:.2%}")
+    if abs(cagr_val) > 0.08:
+        warnings.append(f"{ticker}: suspicious cash-proxy CAGR: {cagr_val:.2%}")
+    if cagr_val < 0:
+        warnings.append(f"{ticker}: negative long-term cash-proxy CAGR: {cagr_val:.2%}")
+    if max_daily_abs > 0.01:
+        warnings.append(f"{ticker}: suspicious cash-proxy daily move: {max_daily_abs:.2%}")
+
+    return warnings
+
+
+def audit_price_data(prices: pd.DataFrame, config: MatvmConfig) -> DataAuditResult:
+    """Validate market data before using it for backtest interpretation."""
+    result = DataAuditResult()
+    prices = _ensure_datetime_index(prices)
+
+    if prices.index.has_duplicates:
+        result.errors.append("price data: duplicate dates found")
+    if not prices.index.is_monotonic_increasing:
+        result.errors.append("price data: dates are not monotonic increasing")
+
+    for ticker in config.required_price_tickers():
+        if ticker not in prices.columns:
+            result.errors.append(f"{ticker}: missing price column")
+            continue
+
+        s = prices[ticker]
+        clean = s.dropna()
+        if clean.empty:
+            result.errors.append(f"{ticker}: no price data")
+            continue
+        if s.isna().any():
+            result.warnings.append(f"{ticker}: missing price values")
+        if (clean <= 0).any():
+            result.errors.append(f"{ticker}: zero or negative prices found")
+            continue
+        if len(clean) < config.min_history_days:
+            result.warnings.append(
+                f"{ticker}: short history ({len(clean)} rows, need at least {config.min_history_days})"
+            )
+
+        rets = clean.pct_change().replace([np.inf, -np.inf], np.nan).dropna()
+        if not rets.empty and float(rets.abs().max()) > 0.25:
+            result.warnings.append(f"{ticker}: extreme daily return: {rets.abs().max():.2%}")
+        if clean.nunique() <= max(2, int(len(clean) * 0.01)):
+            result.warnings.append(f"{ticker}: suspiciously flat price history")
+        if _looks_like_make_fake_data(clean):
+            result.warnings.append(
+                f"{ticker}: looks like placeholder data generated by make_fake_data.py"
+            )
+
+    if config.cash_ticker in prices.columns:
+        result.warnings.extend(audit_cash_proxy(prices[config.cash_ticker], config.cash_ticker))
+
+    if (
+        str(config.risk_free_mode).strip().lower() == "ticker"
+        and config.risk_free_ticker
+        and config.risk_free_ticker in prices.columns
+        and config.risk_free_ticker != config.cash_ticker
+    ):
+        result.warnings.extend(
+            audit_cash_proxy(prices[config.risk_free_ticker], config.risk_free_ticker)
+        )
+
+    return result
+
+
+@dataclass
 class BacktestResult:
     equity_curve: pd.Series
     weights: pd.DataFrame
@@ -499,14 +656,16 @@ def backtest(
     prices = _ensure_datetime_index(prices).sort_index()
 
     tickers = config.all_tickers()
-    missing = [t for t in tickers if t not in prices.columns]
+    required_tickers = config.required_price_tickers()
+    missing = [t for t in required_tickers if t not in prices.columns]
     if missing:
         raise ValueError(f"Prices missing columns: {missing}")
 
-    prices = prices[tickers].copy()
+    prices = prices[required_tickers].copy()
     prices = prices.ffill().dropna()
 
     rets = simple_returns(prices)
+    portfolio_rets = rets[tickers]
 
     # Determine signal dates: actual last trading day of each week
     last_trading_each_week = prices.index.to_series().resample("W-FRI").last().dropna()
@@ -537,7 +696,7 @@ def backtest(
 
         # Apply daily return using weights held from previous close to this close
         if i > 0:
-            r = float((w_current * rets.loc[dt]).sum())
+            r = float((w_current * portfolio_rets.loc[dt]).sum())
             V *= (1.0 + r)
 
         # Track peak/drawdown
@@ -605,14 +764,16 @@ def backtest(
 
     daily_port_ret = equity_curve.pct_change().fillna(0.0)
 
-    # Use cash ticker returns as rf proxy (optional)
-    daily_rf = rets[config.cash_ticker].reindex_like(daily_port_ret).fillna(0.0)
+    daily_rf_zero = pd.Series(0.0, index=daily_port_ret.index)
+    daily_rf_config = get_daily_rf(rets, config).reindex_like(daily_port_ret).fillna(0.0)
 
     stats = {
         "CAGR": cagr(equity_curve),
         "MaxDrawdown": max_drawdown(equity_curve),
-        "Sharpe": sharpe_ratio(daily_port_ret, daily_rf=daily_rf),
-        "Sortino": sortino_ratio(daily_port_ret, daily_rf=daily_rf),
+        "Sharpe_RF0": sharpe_ratio(daily_port_ret, daily_rf=daily_rf_zero),
+        "Sortino_RF0": sortino_ratio(daily_port_ret, daily_rf=daily_rf_zero),
+        "Sharpe_Excess": sharpe_ratio(daily_port_ret, daily_rf=daily_rf_config),
+        "Sortino_Excess": sortino_ratio(daily_port_ret, daily_rf=daily_rf_config),
     }
     stats["Calmar"] = (
         stats["CAGR"] / stats["MaxDrawdown"] if stats["MaxDrawdown"] > 0 else 0.0
@@ -1198,22 +1359,55 @@ def cli_backtest(args: argparse.Namespace) -> None:
         cfg.risk_tickers = [s.strip().upper() for s in args.risk.split(",") if s.strip()]
     if args.cash:
         cfg.cash_ticker = args.cash.strip().upper()
+    cfg.risk_free_mode = args.risk_free_mode.strip().lower()
+    cfg.risk_free_ticker = (
+        args.risk_free_ticker.strip().upper() if args.risk_free_ticker else None
+    )
+    cfg.annual_risk_free_rate = float(args.annual_risk_free_rate)
 
-    tickers = cfg.all_tickers()
+    if cfg.risk_free_mode == "ticker" and not cfg.risk_free_ticker:
+        raise SystemExit("--risk-free-ticker is required when --risk-free-mode ticker")
+
+    tickers = cfg.required_price_tickers()
 
     if args.csv_folder:
         prices = load_prices_from_csv(Path(args.csv_folder), tickers)
     else:
         prices = load_prices_from_yfinance(tickers, start=args.start, end=args.end)
 
+    audit = audit_price_data(prices, cfg)
+    if audit.has_issues():
+        print("\n=== DATA AUDIT ===")
+        for err in audit.errors:
+            print(f"ERROR:   {err}")
+        for warning in audit.warnings:
+            print(f"WARNING: {warning}")
+        if audit.errors:
+            raise SystemExit("Data audit failed with errors.")
+        if args.strict_data:
+            raise SystemExit("Strict data audit failed because warnings were found.")
+
     res = backtest(prices=prices, config=cfg, initial_capital=float(args.initial))
+
+    print("\n=== Backtest config ===")
+    if audit.has_issues():
+        print(f"{'Backtest status':>22}: DIAGNOSTIC ONLY")
+        print(f"{'Reason':>22}: data audit warnings detected")
+    else:
+        print(f"{'Backtest status':>22}: CLEAN DATA CHECK PASSED")
+    print(f"{'Cash asset':>22}: {cfg.cash_ticker}")
+    print(f"{'Risk-free mode':>22}: {cfg.risk_free_mode}")
+    if cfg.risk_free_mode == "ticker":
+        print(f"{'Risk-free ticker':>22}: {cfg.risk_free_ticker}")
+    elif cfg.risk_free_mode == "constant":
+        print(f"{'Annual risk-free rate':>22}: {cfg.annual_risk_free_rate:.2%}")
 
     print("\n=== Backtest stats ===")
     for k, v in res.stats.items():
         if k in {"CAGR", "MaxDrawdown"}:
-            print(f"{k:>14}: {v:8.2%}")
+            print(f"{k:>22}: {v:8.2%}")
         else:
-            print(f"{k:>14}: {v:8.3f}")
+            print(f"{k:>22}: {v:8.3f}")
 
     outdir = Path(args.outdir) if args.outdir else Path("./matvm_out")
     outdir.mkdir(parents=True, exist_ok=True)
@@ -1274,9 +1468,31 @@ def build_parser() -> argparse.ArgumentParser:
     b.add_argument("--initial", default="100000")
     b.add_argument("--risk", default=None, help="Comma-separated risk tickers")
     b.add_argument("--cash", default=None, help="Cash ticker")
+    b.add_argument(
+        "--risk-free-mode",
+        choices=sorted(RISK_FREE_MODES),
+        default="zero",
+        help="Benchmark for excess-return Sharpe/Sortino",
+    )
+    b.add_argument(
+        "--risk-free-ticker",
+        default=None,
+        help="Ticker to use when --risk-free-mode ticker",
+    )
+    b.add_argument(
+        "--annual-risk-free-rate",
+        type=float,
+        default=0.0,
+        help="Decimal annual rate to use when --risk-free-mode constant, e.g. 0.05",
+    )
     b.add_argument("--csv-folder", default=None, help="Folder with <TICKER>.csv files")
     b.add_argument("--outdir", default="./matvm_out")
     b.add_argument("--plot", action="store_true")
+    b.add_argument(
+        "--strict-data",
+        action="store_true",
+        help="Fail the backtest when data audit warnings are found",
+    )
     b.set_defaults(func=cli_backtest)
 
     # Live IBKR
