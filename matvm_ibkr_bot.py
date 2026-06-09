@@ -36,6 +36,7 @@ DECISION_MIN_EXCESS_SHARPE = 0.50
 DECISION_MATERIAL_DD_REDUCTION = 0.08
 VOL_TARGET_BENCHMARKS = (0.08, 0.10, 0.12)
 VOL_TARGET_LOOKBACK_DAYS = 63
+EXPOSURE_MATCHED_PREFIXES = ("StaticMatched_", "SameCashSchedule_")
 DIAGNOSTIC_OUTPUT_TABLES = {
     "allocation_history",
     "asset_weight_summary",
@@ -1105,6 +1106,29 @@ def _best_benchmark(df: pd.DataFrame, metric: str, mode: str) -> Optional[str]:
     return str(row.get("Label") or row.get("Benchmark"))
 
 
+def _active_rows_with_prefixes(df: pd.DataFrame, prefixes: Sequence[str]) -> pd.DataFrame:
+    if df.empty or "Benchmark" not in df.columns:
+        return pd.DataFrame()
+    mask = pd.Series(False, index=df.index)
+    names = df["Benchmark"].astype(str)
+    for prefix in prefixes:
+        mask = mask | names.str.startswith(prefix)
+    rows = df[mask & (df.get("Status", "") == "OK")].copy()
+    if rows.empty:
+        return rows
+    rows["Benchmark_Sharpe_Excess"] = pd.to_numeric(
+        rows["Benchmark_Sharpe_Excess"], errors="coerce"
+    )
+    return rows.dropna(subset=["Benchmark_Sharpe_Excess"])
+
+
+def _best_active_row(df: pd.DataFrame, prefixes: Sequence[str]) -> Optional[pd.Series]:
+    rows = _active_rows_with_prefixes(df, prefixes)
+    if rows.empty:
+        return None
+    return rows.loc[rows["Benchmark_Sharpe_Excess"].idxmax()]
+
+
 def _classify_strategy(summary: Dict[str, object]) -> Tuple[str, List[str]]:
     reasons: List[str] = []
 
@@ -1117,6 +1141,10 @@ def _classify_strategy(summary: Dict[str, object]) -> Tuple[str, List[str]]:
     ew_sharpe_delta = _metric_value(summary.get("EqualWeightRisk_Sharpe_Delta"))
     ew_dd_reduction = _metric_value(summary.get("EqualWeightRisk_Drawdown_Reduction"))
     vol_target_sharpe_delta = _metric_value(summary.get("BestVolTarget_Sharpe_Delta"))
+    exposure_sharpe_delta = _metric_value(summary.get("ExposureMatched_Sharpe_Excess_Delta"))
+    same_cash_sharpe_delta = _metric_value(summary.get("SameCashSchedule_Sharpe_Excess_Delta"))
+    cash_timing = _metric_value(summary.get("CashTimingContribution"))
+    asset_selection = _metric_value(summary.get("AssetSelectionContribution"))
 
     if negative_folds > 0:
         reasons.append("At least one walk-forward fold has negative excess Sharpe")
@@ -1130,14 +1158,41 @@ def _classify_strategy(summary: Dict[str, object]) -> Tuple[str, List[str]]:
         reasons.append("Strategy underperforms EqualWeightRisk on excess Sharpe")
     if vol_target_sharpe_delta is not None and vol_target_sharpe_delta < 0:
         reasons.append("Strategy underperforms best VolTarget VTI/cash benchmark on excess Sharpe")
+    if exposure_sharpe_delta is not None:
+        if exposure_sharpe_delta >= 0:
+            reasons.append("Strategy beats best exposure-matched benchmark on excess Sharpe")
+        else:
+            reasons.append("Strategy loses to best exposure-matched benchmark on excess Sharpe")
+    if same_cash_sharpe_delta is not None:
+        if same_cash_sharpe_delta >= 0:
+            reasons.append("Strategy beats best same-cash-schedule benchmark on excess Sharpe")
+        else:
+            reasons.append("Strategy loses to best same-cash-schedule benchmark on excess Sharpe")
     if ew_dd_reduction is not None and ew_dd_reduction >= DECISION_MATERIAL_DD_REDUCTION:
         reasons.append("Strategy materially reduces drawdown versus EqualWeightRisk")
+    if cash_timing is not None:
+        if cash_timing > 0:
+            if asset_selection is not None and cash_timing > max(asset_selection, 0.0):
+                reasons.append("Strategy return is mostly explained by cash timing versus static exposure")
+            else:
+                reasons.append("Cash timing contribution is positive versus static exposure")
+        elif cash_timing < 0:
+            reasons.append("Cash timing contribution is negative versus static exposure")
+    if asset_selection is not None:
+        if asset_selection > 0:
+            reasons.append("Asset selection contribution is positive versus same cash schedule")
+        elif asset_selection < 0:
+            reasons.append("Asset selection contribution is negative versus same cash schedule")
 
     if (
         strategy_sharpe is not None
         and strategy_sharpe >= DECISION_MIN_EXCESS_SHARPE
         and ew_dd_reduction is not None
         and ew_dd_reduction >= DECISION_MATERIAL_DD_REDUCTION
+        and exposure_sharpe_delta is not None
+        and exposure_sharpe_delta >= 0
+        and same_cash_sharpe_delta is not None
+        and same_cash_sharpe_delta >= 0
         and negative_folds == 0
     ):
         return "PASS_DEFENSIVE_CANDIDATE", reasons
@@ -1168,6 +1223,8 @@ def _robustness_decision_summary(
     walk_forward = tables["walk_forward"]
 
     ew = _first_ok_row(active, "Benchmark", "EqualWeightRisk")
+    static_ew = _first_ok_row(active, "Benchmark", "StaticMatched_EqualWeightRisk_Cash")
+    same_ew = _first_ok_row(active, "Benchmark", "SameCashSchedule_EqualWeightRisk")
     wf_sharpe = (
         pd.to_numeric(walk_forward["Sharpe_Excess"], errors="coerce").dropna()
         if "Sharpe_Excess" in walk_forward.columns
@@ -1216,17 +1273,8 @@ def _robustness_decision_summary(
             }
         )
 
-    vol_rows = active[
-        active.get("Benchmark", pd.Series(dtype=str)).astype(str).str.startswith("VolTarget_VTI_Cash_")
-        & (active.get("Status", "") == "OK")
-    ].copy()
-    if not vol_rows.empty:
-        vol_rows["Benchmark_Sharpe_Excess"] = pd.to_numeric(
-            vol_rows["Benchmark_Sharpe_Excess"], errors="coerce"
-        )
-        vol_rows = vol_rows.dropna(subset=["Benchmark_Sharpe_Excess"])
-    if not vol_rows.empty:
-        best_vol = vol_rows.loc[vol_rows["Benchmark_Sharpe_Excess"].idxmax()]
+    best_vol = _best_active_row(active, ("VolTarget_VTI_Cash_",))
+    if best_vol is not None:
         summary.update(
             {
                 "BestVolTargetBenchmark": best_vol.get("Benchmark"),
@@ -1244,6 +1292,123 @@ def _robustness_decision_summary(
                 "BestVolTarget_Drawdown_Reduction": None,
             }
         )
+
+    best_static = _best_active_row(active, ("StaticMatched_",))
+    best_same = _best_active_row(active, ("SameCashSchedule_",))
+    best_exposure = _best_active_row(active, EXPOSURE_MATCHED_PREFIXES)
+
+    if best_exposure is not None:
+        summary.update(
+            {
+                "BestExposureMatchedBenchmark": best_exposure.get("Benchmark"),
+                "ExposureMatched_CAGR_Delta": best_exposure.get("Active_CAGR"),
+                "ExposureMatched_Sharpe_Excess_Delta": best_exposure.get("Active_Sharpe_Excess"),
+                "ExposureMatched_MaxDD_Reduction": best_exposure.get("Drawdown_Reduction"),
+            }
+        )
+    else:
+        summary.update(
+            {
+                "BestExposureMatchedBenchmark": None,
+                "ExposureMatched_CAGR_Delta": None,
+                "ExposureMatched_Sharpe_Excess_Delta": None,
+                "ExposureMatched_MaxDD_Reduction": None,
+            }
+        )
+
+    if best_static is not None:
+        summary.update(
+            {
+                "BestStaticMatchedBenchmark": best_static.get("Benchmark"),
+                "StaticMatched_CAGR_Delta": best_static.get("Active_CAGR"),
+                "StaticMatched_Sharpe_Excess_Delta": best_static.get("Active_Sharpe_Excess"),
+                "StaticMatched_MaxDD_Reduction": best_static.get("Drawdown_Reduction"),
+            }
+        )
+    else:
+        summary.update(
+            {
+                "BestStaticMatchedBenchmark": None,
+                "StaticMatched_CAGR_Delta": None,
+                "StaticMatched_Sharpe_Excess_Delta": None,
+                "StaticMatched_MaxDD_Reduction": None,
+            }
+        )
+
+    if best_same is not None:
+        summary.update(
+            {
+                "BestSameCashScheduleBenchmark": best_same.get("Benchmark"),
+                "SameCashSchedule_CAGR_Delta": best_same.get("Active_CAGR"),
+                "SameCashSchedule_Sharpe_Excess_Delta": best_same.get("Active_Sharpe_Excess"),
+                "SameCashSchedule_MaxDD_Reduction": best_same.get("Drawdown_Reduction"),
+            }
+        )
+    else:
+        summary.update(
+            {
+                "BestSameCashScheduleBenchmark": None,
+                "SameCashSchedule_CAGR_Delta": None,
+                "SameCashSchedule_Sharpe_Excess_Delta": None,
+                "SameCashSchedule_MaxDD_Reduction": None,
+            }
+        )
+
+    def _row_metric(row: Optional[pd.Series], key: str) -> Optional[float]:
+        if row is None:
+            return None
+        return _metric_value(row.get(key))
+
+    static_ew_cagr = _row_metric(static_ew, "Benchmark_CAGR")
+    same_ew_cagr = _row_metric(same_ew, "Benchmark_CAGR")
+    ew_cagr = _row_metric(ew, "Benchmark_CAGR")
+    strategy_cagr = _metric_value(summary.get("Strategy_CAGR"))
+
+    static_ew_sharpe = _row_metric(static_ew, "Benchmark_Sharpe_Excess")
+    same_ew_sharpe = _row_metric(same_ew, "Benchmark_Sharpe_Excess")
+    ew_sharpe = _row_metric(ew, "Benchmark_Sharpe_Excess")
+    strategy_sharpe = _metric_value(summary.get("Strategy_Sharpe_Excess"))
+
+    summary.update(
+        {
+            "StaticMatched_EqualWeightRisk_CAGR": static_ew_cagr,
+            "SameCashSchedule_EqualWeightRisk_CAGR": same_ew_cagr,
+            "EqualWeightRisk_CAGR": ew_cagr,
+            "AssetSelectionContribution": (
+                strategy_cagr - same_ew_cagr
+                if strategy_cagr is not None and same_ew_cagr is not None
+                else None
+            ),
+            "CashTimingContribution": (
+                same_ew_cagr - static_ew_cagr
+                if same_ew_cagr is not None and static_ew_cagr is not None
+                else None
+            ),
+            "ExposureEffect": (
+                static_ew_cagr - ew_cagr
+                if static_ew_cagr is not None and ew_cagr is not None
+                else None
+            ),
+            "StaticMatched_EqualWeightRisk_Sharpe_Excess": static_ew_sharpe,
+            "SameCashSchedule_EqualWeightRisk_Sharpe_Excess": same_ew_sharpe,
+            "EqualWeightRisk_Sharpe_Excess": ew_sharpe,
+            "AssetSelectionContribution_Sharpe_Excess": (
+                strategy_sharpe - same_ew_sharpe
+                if strategy_sharpe is not None and same_ew_sharpe is not None
+                else None
+            ),
+            "CashTimingContribution_Sharpe_Excess": (
+                same_ew_sharpe - static_ew_sharpe
+                if same_ew_sharpe is not None and static_ew_sharpe is not None
+                else None
+            ),
+            "ExposureEffect_Sharpe_Excess": (
+                static_ew_sharpe - ew_sharpe
+                if static_ew_sharpe is not None and ew_sharpe is not None
+                else None
+            ),
+        }
+    )
 
     decision, reasons = _classify_strategy(summary)
     summary["Decision"] = decision
@@ -1285,6 +1450,26 @@ def _write_summary_markdown(outdir: Path, summary: Dict[str, object]) -> None:
         f"- Active CAGR: {_fmt_metric(summary.get('BestVolTarget_CAGR_Delta'), pct=True)}",
         f"- Active excess Sharpe: {_fmt_metric(summary.get('BestVolTarget_Sharpe_Delta'))}",
         f"- Drawdown reduction: {_fmt_metric(summary.get('BestVolTarget_Drawdown_Reduction'), pct=True)}",
+        "",
+        "## Exposure-Matched Comparison",
+        "",
+        f"- Best exposure-matched benchmark: {summary.get('BestExposureMatchedBenchmark')}",
+        f"- Active CAGR: {_fmt_metric(summary.get('ExposureMatched_CAGR_Delta'), pct=True)}",
+        f"- Active excess Sharpe: {_fmt_metric(summary.get('ExposureMatched_Sharpe_Excess_Delta'))}",
+        f"- Drawdown reduction: {_fmt_metric(summary.get('ExposureMatched_MaxDD_Reduction'), pct=True)}",
+        f"- Best static matched benchmark: {summary.get('BestStaticMatchedBenchmark')}",
+        f"- Static matched active excess Sharpe: {_fmt_metric(summary.get('StaticMatched_Sharpe_Excess_Delta'))}",
+        f"- Best same-cash-schedule benchmark: {summary.get('BestSameCashScheduleBenchmark')}",
+        f"- Same-cash active excess Sharpe: {_fmt_metric(summary.get('SameCashSchedule_Sharpe_Excess_Delta'))}",
+        "",
+        "## Attribution",
+        "",
+        f"- Asset selection contribution: {_fmt_metric(summary.get('AssetSelectionContribution'), pct=True)}",
+        f"- Cash timing contribution: {_fmt_metric(summary.get('CashTimingContribution'), pct=True)}",
+        f"- Exposure effect: {_fmt_metric(summary.get('ExposureEffect'), pct=True)}",
+        f"- Asset selection Sharpe contribution: {_fmt_metric(summary.get('AssetSelectionContribution_Sharpe_Excess'))}",
+        f"- Cash timing Sharpe contribution: {_fmt_metric(summary.get('CashTimingContribution_Sharpe_Excess'))}",
+        f"- Exposure effect Sharpe contribution: {_fmt_metric(summary.get('ExposureEffect_Sharpe_Excess'))}",
         "",
         "## Benchmarks",
         "",
@@ -1447,6 +1632,125 @@ def _benchmark_equity(returns: pd.DataFrame, weights: Dict[str, float]) -> Optio
     return (1.0 + bench_daily).cumprod()
 
 
+def _risk_sleeve_specs(config: MatvmConfig) -> List[Tuple[str, Dict[str, float]]]:
+    return [
+        ("VTI", {"VTI": 1.0}),
+        ("EqualWeightRisk", {t: 1.0 / len(config.risk_tickers) for t in config.risk_tickers}),
+        (
+            "EqualWeightFull",
+            {t: 1.0 / len(config.risk_tickers) for t in config.risk_tickers},
+        ),
+        ("60_40", {"VTI": 0.60, "TLT": 0.40}),
+    ]
+
+
+def _equity_from_daily_returns(daily_returns: pd.Series, name: str) -> pd.Series:
+    return (1.0 + daily_returns.fillna(0.0)).cumprod().rename(name)
+
+
+def _baseline_weights_for_returns(
+    baseline: BacktestResult,
+    returns: pd.DataFrame,
+    config: MatvmConfig,
+) -> pd.DataFrame:
+    weights = baseline.weights.reindex(returns.index).ffill().fillna(0.0)
+    for ticker in config.all_tickers():
+        if ticker not in weights.columns:
+            weights[ticker] = 0.0
+    return weights[config.all_tickers()]
+
+
+def _static_matched_benchmark_results(
+    returns: pd.DataFrame,
+    config: MatvmConfig,
+    baseline: BacktestResult,
+) -> List[Dict[str, object]]:
+    if config.cash_ticker not in returns.columns:
+        return []
+
+    weights = _baseline_weights_for_returns(
+        baseline=baseline,
+        returns=returns,
+        config=config,
+    )
+    avg_cash_weight = float(weights[config.cash_ticker].mean())
+    avg_cash_weight = min(max(avg_cash_weight, 0.0), 1.0)
+    risk_weight = 1.0 - avg_cash_weight
+
+    results: List[Dict[str, object]] = []
+    for sleeve_name, sleeve_weights in _risk_sleeve_specs(config):
+        risk_daily = _benchmark_daily_returns(returns, sleeve_weights)
+        if risk_daily is None:
+            results.append(
+                {
+                    "label": f"StaticMatched_{sleeve_name}_Cash",
+                    "note": "",
+                    "equity": None,
+                    "avg_turnover": 0.0,
+                    "matched_cash_weight": avg_cash_weight,
+                }
+            )
+            continue
+        daily = risk_weight * risk_daily + avg_cash_weight * returns[config.cash_ticker]
+        results.append(
+            {
+                "label": f"StaticMatched_{sleeve_name}_Cash",
+                "note": "",
+                "equity": _equity_from_daily_returns(daily, f"StaticMatched_{sleeve_name}_Cash"),
+                "avg_turnover": 0.0,
+                "matched_cash_weight": avg_cash_weight,
+            }
+        )
+
+    return results
+
+
+def _same_cash_schedule_benchmark_results(
+    returns: pd.DataFrame,
+    config: MatvmConfig,
+    baseline: BacktestResult,
+) -> List[Dict[str, object]]:
+    if config.cash_ticker not in returns.columns:
+        return []
+
+    weights = _baseline_weights_for_returns(
+        baseline=baseline,
+        returns=returns,
+        config=config,
+    )
+    weights_for_return = weights.shift(1).fillna(0.0)
+    cash_weight = weights_for_return[config.cash_ticker].reindex(returns.index).fillna(1.0)
+    cash_weight = cash_weight.clip(lower=0.0, upper=1.0)
+    risk_weight = 1.0 - cash_weight
+
+    results: List[Dict[str, object]] = []
+    for sleeve_name, sleeve_weights in _risk_sleeve_specs(config):
+        risk_daily = _benchmark_daily_returns(returns, sleeve_weights)
+        if risk_daily is None:
+            results.append(
+                {
+                    "label": f"SameCashSchedule_{sleeve_name}",
+                    "note": "",
+                    "equity": None,
+                    "avg_turnover": 0.0,
+                    "matched_cash_weight": float(cash_weight.mean()),
+                }
+            )
+            continue
+        daily = risk_weight * risk_daily + cash_weight * returns[config.cash_ticker]
+        results.append(
+            {
+                "label": f"SameCashSchedule_{sleeve_name}",
+                "note": "",
+                "equity": _equity_from_daily_returns(daily, f"SameCashSchedule_{sleeve_name}"),
+                "avg_turnover": 0.0,
+                "matched_cash_weight": float(cash_weight.mean()),
+            }
+        )
+
+    return results
+
+
 def _vol_target_vti_cash_benchmark(
     returns: pd.DataFrame,
     config: MatvmConfig,
@@ -1556,6 +1860,7 @@ def _benchmark_results(
     prices: pd.DataFrame,
     config: MatvmConfig,
     daily_rf: pd.Series,
+    baseline: Optional[BacktestResult] = None,
 ) -> List[Dict[str, object]]:
     returns = _benchmark_return_frame(prices, config)
     results: List[Dict[str, object]] = []
@@ -1568,6 +1873,22 @@ def _benchmark_results(
                 "equity": _benchmark_equity(returns, weights),
                 "avg_turnover": 0.0,
             }
+        )
+
+    if baseline is not None:
+        results.extend(
+            _static_matched_benchmark_results(
+                returns=returns,
+                config=config,
+                baseline=baseline,
+            )
+        )
+        results.extend(
+            _same_cash_schedule_benchmark_results(
+                returns=returns,
+                config=config,
+                baseline=baseline,
+            )
         )
 
     for target_vol in VOL_TARGET_BENCHMARKS:
@@ -1593,9 +1914,10 @@ def _benchmark_table(
     prices: pd.DataFrame,
     config: MatvmConfig,
     daily_rf: pd.Series,
+    baseline: Optional[BacktestResult] = None,
 ) -> pd.DataFrame:
     rows = []
-    for result in _benchmark_results(prices, config, daily_rf):
+    for result in _benchmark_results(prices, config, daily_rf, baseline=baseline):
         label = str(result["label"])
         note = str(result.get("note") or "")
         equity = result.get("equity")
@@ -1622,6 +1944,7 @@ def _benchmark_table(
                 extra={
                     "BenchmarkNote": note,
                     "AvgWeeklyTurnover": float(result.get("avg_turnover") or 0.0),
+                    "MatchedCashWeight": result.get("matched_cash_weight"),
                 },
             )
         )
@@ -1637,7 +1960,7 @@ def _active_benchmark_table(
     rows = []
     strategy_turnover = float(baseline.stats.get("AvgWeeklyTurnover", 0.0))
 
-    for result in _benchmark_results(prices, config, daily_rf):
+    for result in _benchmark_results(prices, config, daily_rf, baseline=baseline):
         label = str(result["label"])
         note = str(result.get("note") or "")
         benchmark_equity = result.get("equity")
@@ -1691,6 +2014,7 @@ def _active_benchmark_table(
             "Strategy_AvgWeeklyTurnover": strategy_turnover,
             "Benchmark_AvgWeeklyTurnover": benchmark_turnover,
             "Turnover_Delta": strategy_turnover - benchmark_turnover,
+            "MatchedCashWeight": result.get("matched_cash_weight"),
         }
         rows.append(row)
 
@@ -2165,6 +2489,7 @@ def run_robustness_analysis(
             prices=prices,
             config=config,
             daily_rf=daily_rf,
+            baseline=baseline,
         ),
         "active_benchmarks": _active_benchmark_table(
             baseline=baseline,
@@ -2919,6 +3244,14 @@ def cli_robustness(args: argparse.Namespace) -> None:
     print(f"{'Best VolTarget':>22}: {summary.get('BestVolTargetBenchmark')}")
     print(f"{'VolTarget Sharpe delta':>22}: {_fmt_metric(summary.get('BestVolTarget_Sharpe_Delta'))}")
     print(f"{'VolTarget DD reduction':>22}: {_fmt_metric(summary.get('BestVolTarget_Drawdown_Reduction'), pct=True)}")
+    print(f"{'Best exposure match':>22}: {summary.get('BestExposureMatchedBenchmark')}")
+    print(f"{'Exposure Sharpe delta':>22}: {_fmt_metric(summary.get('ExposureMatched_Sharpe_Excess_Delta'))}")
+    print(f"{'Exposure DD reduction':>22}: {_fmt_metric(summary.get('ExposureMatched_MaxDD_Reduction'), pct=True)}")
+    print(f"{'Best same-cash':>22}: {summary.get('BestSameCashScheduleBenchmark')}")
+    print(f"{'Same-cash Sharpe delta':>22}: {_fmt_metric(summary.get('SameCashSchedule_Sharpe_Excess_Delta'))}")
+    print(f"{'Same-cash DD reduction':>22}: {_fmt_metric(summary.get('SameCashSchedule_MaxDD_Reduction'), pct=True)}")
+    print(f"{'Cash timing contrib':>22}: {_fmt_metric(summary.get('CashTimingContribution'), pct=True)}")
+    print(f"{'Asset select contrib':>22}: {_fmt_metric(summary.get('AssetSelectionContribution'), pct=True)}")
     print(f"{'WF negative folds':>22}: {summary.get('WalkForwardNegativeFoldCount')}")
     reasons = summary.get("Reason") or []
     if reasons:
@@ -2979,6 +3312,7 @@ def cli_robustness(args: argparse.Namespace) -> None:
         "Benchmark",
         "BenchmarkNote",
         "Status",
+        "MatchedCashWeight",
         "Strategy_CAGR",
         "Benchmark_CAGR",
         "Active_CAGR",
