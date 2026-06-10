@@ -40,6 +40,40 @@ ASSET_SELECTION_MODES = {
     "min_vol_only",
     "risk_parity_selected",
     "random_selected",
+    "score_model",
+}
+SCORE_MODEL_MODES = {
+    "current_composite",
+    "momentum_only",
+    "risk_adjusted_momentum_only",
+    "momentum_plus_trend",
+    "momentum_minus_volatility",
+    "momentum_trend_minus_volatility",
+    "ic_weighted_composite_static",
+    "ic_weighted_composite_nonnegative",
+    "top_bucket_equal_weight",
+    "rank_weighted_top_k",
+    "score_weighted_top_k",
+}
+SCORE_MODEL_COMPONENTS = (
+    "MomentumScore",
+    "RiskAdjustedMomentumScore",
+    "TrendScore",
+    "VolatilityScore",
+    "DrawdownScore",
+)
+SCORE_MODEL_LABELS = {
+    "current_composite": "CurrentComposite",
+    "momentum_only": "MomentumOnly",
+    "risk_adjusted_momentum_only": "RiskAdjustedMomentumOnly",
+    "momentum_plus_trend": "MomentumPlusTrend",
+    "momentum_minus_volatility": "MomentumMinusVolatility",
+    "momentum_trend_minus_volatility": "MomentumTrendMinusVolatility",
+    "ic_weighted_composite_static": "ICWeightedComposite_Static",
+    "ic_weighted_composite_nonnegative": "ICWeightedComposite_NonNegative",
+    "top_bucket_equal_weight": "TopBucketEqualWeight",
+    "rank_weighted_top_k": "RankWeightedTopK",
+    "score_weighted_top_k": "ScoreWeightedTopK",
 }
 MIN_DAILY_RETURN_STD = 1e-5
 DECISION_MIN_EXCESS_SHARPE = 0.50
@@ -219,6 +253,9 @@ class MatvmConfig:
     fixed_cash_weight: Optional[float] = None
     asset_selection_mode: str = "base"
     asset_selection_seed: Optional[int] = None
+    score_model: str = "current_composite"
+    score_model_weights: Dict[str, float] = field(default_factory=dict)
+    score_top_k: int = 3
 
     # Capital preservation overlay (drawdown thresholds)
     dd_half: float = 0.08
@@ -428,6 +465,166 @@ class MatvmStrategy:
         out.loc[fixed.index] = fixed
         return out
 
+    @staticmethod
+    def _cross_section_zscore(values: pd.Series) -> pd.Series:
+        values = pd.to_numeric(values, errors="coerce").replace([np.inf, -np.inf], np.nan)
+        values = values.fillna(0.0)
+        sd = float(values.std(ddof=0))
+        if sd <= 1e-12 or np.isnan(sd):
+            return pd.Series(0.0, index=values.index, dtype=float)
+        return (values - float(values.mean())) / sd
+
+    @staticmethod
+    def _positive_weights_from_scores(scores: pd.Series) -> pd.Series:
+        scores = pd.to_numeric(scores, errors="coerce").replace([np.inf, -np.inf], np.nan)
+        scores = scores.fillna(0.0)
+        positive = scores.clip(lower=0.0)
+        if float(positive.sum()) > 0.0:
+            return positive / float(positive.sum())
+
+        shifted = scores - float(scores.min())
+        if float(shifted.sum()) > 0.0:
+            return shifted / float(shifted.sum())
+
+        out = pd.Series(0.0, index=scores.index, dtype=float)
+        if not out.empty:
+            out.loc[scores.idxmax()] = 1.0
+        return out
+
+    def _score_model_components(
+        self,
+        prices: pd.DataFrame,
+        asof: pd.Timestamp,
+        q: pd.Series,
+        sigma: pd.Series,
+        sma200: pd.Series,
+        e_hyst: pd.Series,
+    ) -> Dict[str, pd.Series]:
+        p0 = prices.loc[asof, self.cfg.risk_tickers]
+        trend_score = (p0 / sma200 - 1.0).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        raw_momentum = self._raw_momentum_scores(prices, asof)
+        rolling_peak = (
+            prices[self.cfg.risk_tickers]
+            .loc[:asof]
+            .tail(self.cfg.sma_window)
+            .max()
+            .replace(0.0, np.nan)
+        )
+        drawdown_score = (p0 / rolling_peak - 1.0).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        cash_filter = e_hyst.reindex(self.cfg.risk_tickers).fillna(0.0)
+        return {
+            "MomentumScore": raw_momentum.reindex(self.cfg.risk_tickers).fillna(0.0),
+            "RiskAdjustedMomentumScore": q.reindex(self.cfg.risk_tickers).fillna(0.0),
+            "TrendScore": trend_score.reindex(self.cfg.risk_tickers).fillna(0.0),
+            "VolatilityScore": (-sigma).reindex(self.cfg.risk_tickers).fillna(0.0),
+            "DrawdownScore": drawdown_score.reindex(self.cfg.risk_tickers).fillna(0.0),
+            "CashFilterScore": cash_filter,
+            "CompositeScore": (q * cash_filter).replace([np.inf, -np.inf], np.nan).fillna(0.0),
+        }
+
+    def _score_model_series(
+        self,
+        prices: pd.DataFrame,
+        asof: pd.Timestamp,
+        q: pd.Series,
+        sigma: pd.Series,
+        sma200: pd.Series,
+        e_hyst: pd.Series,
+    ) -> pd.Series:
+        model = str(self.cfg.score_model).strip().lower()
+        if model not in SCORE_MODEL_MODES:
+            raise ValueError(f"Unknown score_model: {self.cfg.score_model}")
+
+        components = self._score_model_components(
+            prices=prices,
+            asof=asof,
+            q=q,
+            sigma=sigma,
+            sma200=sma200,
+            e_hyst=e_hyst,
+        )
+        z = {name: self._cross_section_zscore(values) for name, values in components.items()}
+
+        if model == "momentum_only":
+            scores = components["MomentumScore"]
+        elif model == "risk_adjusted_momentum_only":
+            scores = components["RiskAdjustedMomentumScore"]
+        elif model == "momentum_plus_trend":
+            scores = z["MomentumScore"] + z["TrendScore"]
+        elif model == "momentum_minus_volatility":
+            scores = z["MomentumScore"] + z["VolatilityScore"]
+        elif model == "momentum_trend_minus_volatility":
+            scores = z["MomentumScore"] + z["TrendScore"] + z["VolatilityScore"]
+        elif model in {"ic_weighted_composite_static", "ic_weighted_composite_nonnegative"}:
+            weights = dict(self.cfg.score_model_weights or {})
+            if not weights:
+                weights = {"MomentumScore": 1.0}
+            scores = pd.Series(0.0, index=self.cfg.risk_tickers, dtype=float)
+            for signal_name, weight in weights.items():
+                if signal_name in z:
+                    scores = scores + float(weight) * z[signal_name]
+        elif model in {"top_bucket_equal_weight", "rank_weighted_top_k", "score_weighted_top_k"}:
+            scores = components["MomentumScore"]
+        else:
+            scores = components["CompositeScore"]
+
+        return scores.reindex(self.cfg.risk_tickers).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+    def _score_model_weights(
+        self,
+        prices: pd.DataFrame,
+        asof: pd.Timestamp,
+        q: pd.Series,
+        sigma: pd.Series,
+        sma200: pd.Series,
+        e_hyst: pd.Series,
+    ) -> pd.Series:
+        model = str(self.cfg.score_model).strip().lower()
+        scores = self._score_model_series(
+            prices=prices,
+            asof=asof,
+            q=q,
+            sigma=sigma,
+            sma200=sma200,
+            e_hyst=e_hyst,
+        )
+        active = [
+            ticker
+            for ticker in self.cfg.risk_tickers
+            if float(e_hyst.get(ticker, 0.0)) > 0.0
+        ]
+        weights = pd.Series(0.0, index=self.cfg.risk_tickers, dtype=float)
+        if not active:
+            return weights
+
+        active_scores = scores.loc[active].sort_values(ascending=False)
+
+        if model == "top_bucket_equal_weight":
+            k = max(1, int(math.ceil(len(active_scores) / 3.0)))
+            chosen = active_scores.head(k).index
+            weights.loc[chosen] = 1.0 / len(chosen)
+            return weights
+
+        if model == "rank_weighted_top_k":
+            k = min(max(int(self.cfg.score_top_k), 1), len(active_scores))
+            chosen = active_scores.head(k)
+            rank_weights = pd.Series(
+                list(range(k, 0, -1)),
+                index=chosen.index,
+                dtype=float,
+            )
+            weights.loc[rank_weights.index] = rank_weights / float(rank_weights.sum())
+            return weights
+
+        if model == "score_weighted_top_k":
+            k = min(max(int(self.cfg.score_top_k), 1), len(active_scores))
+            chosen = active_scores.head(k)
+            weights.loc[chosen.index] = self._positive_weights_from_scores(chosen)
+            return weights
+
+        weights.loc[active_scores.index] = self._positive_weights_from_scores(active_scores)
+        return weights
+
     def _portfolio_vol(
         self, prices: pd.DataFrame, asof: pd.Timestamp, weights: pd.Series
     ) -> float:
@@ -464,6 +661,7 @@ class MatvmStrategy:
         asof: pd.Timestamp,
         q: pd.Series,
         sigma: pd.Series,
+        sma200: pd.Series,
         trend: pd.Series,
         e_hyst: pd.Series,
     ) -> pd.Series:
@@ -472,6 +670,16 @@ class MatvmStrategy:
             raise ValueError(f"Unknown asset_selection_mode: {self.cfg.asset_selection_mode}")
 
         weights = pd.Series(0.0, index=self.cfg.risk_tickers, dtype=float)
+
+        if mode == "score_model":
+            return self._score_model_weights(
+                prices=prices,
+                asof=asof,
+                q=q,
+                sigma=sigma,
+                sma200=sma200,
+                e_hyst=e_hyst,
+            )
 
         if mode == "top_momentum_no_vol_filter":
             raw_momentum = self._raw_momentum_scores(prices, asof)
@@ -599,6 +807,7 @@ class MatvmStrategy:
             asof=asof,
             q=q,
             sigma=sigma,
+            sma200=sma200,
             trend=trend,
             e_hyst=e_hyst,
         )
@@ -1033,6 +1242,7 @@ def _clone_config(config: MatvmConfig, **updates: object) -> MatvmConfig:
     cfg = dataclasses.replace(config)
     cfg.risk_tickers = list(config.risk_tickers)
     cfg.momentum_windows = tuple(config.momentum_windows)
+    cfg.score_model_weights = dict(config.score_model_weights)
     for key, value in updates.items():
         setattr(cfg, key, value)
     return cfg
@@ -1304,6 +1514,28 @@ def _classify_strategy(summary: Dict[str, object]) -> Tuple[str, List[str]]:
     composite_pos_ic_4w = _metric_value(summary.get("CompositeScore_PositiveICRate_4W"))
     top_bottom_4w = _metric_value(summary.get("TopBucketMinusBottomBucket_4W"))
     signal_decision = summary.get("SignalPredictiveDecision")
+    signal_model_decision = summary.get("SignalModelDecision")
+    wf_signal_model_negative_folds = int(
+        summary.get("WalkForwardSignalModelNegativeFoldCount") or 0
+    )
+    best_score_static_delta = _metric_value(
+        summary.get("BestScoreModel_vs_StaticMatched_Sharpe_Excess_Delta")
+    )
+    best_score_same_delta = _metric_value(
+        summary.get("BestScoreModel_vs_SameCashSchedule_Sharpe_Excess_Delta")
+    )
+    best_score_dd_reduction = _metric_value(
+        summary.get("BestScoreModel_vs_EqualWeightRisk_MaxDD_Reduction")
+    )
+    momentum_vs_composite = _metric_value(
+        summary.get("MomentumOnly_vs_CurrentComposite_Sharpe_Excess_Delta")
+    )
+    rebalance_4w_vs_weekly = _metric_value(
+        summary.get("Rebalance4W_vs_Weekly_Sharpe_Excess_Delta")
+    )
+    rebalance_4w_turnover_delta = _metric_value(
+        summary.get("Rebalance4W_vs_Weekly_Turnover_Delta")
+    )
     candidate_mean_active_sharpe = _metric_value(
         summary.get("WalkForwardCandidateMeanActiveSharpe")
     )
@@ -1313,6 +1545,8 @@ def _classify_strategy(summary: Dict[str, object]) -> Tuple[str, List[str]]:
         reasons.append("At least one walk-forward fold has negative excess Sharpe")
     if candidate_negative_folds > 0:
         reasons.append("At least one walk-forward candidate-selection fold has negative excess Sharpe")
+    if wf_signal_model_negative_folds > 0:
+        reasons.append("At least one walk-forward signal-model fold has negative excess Sharpe")
     if worst_wf is not None:
         reasons.append(f"Worst walk-forward excess Sharpe is {worst_wf:.3f}")
     if strategy_sharpe is None or strategy_sharpe < DECISION_MIN_EXCESS_SHARPE:
@@ -1412,6 +1646,36 @@ def _classify_strategy(summary: Dict[str, object]) -> Tuple[str, List[str]]:
         reasons.append(f"CompositeScore 4W positive IC rate is {composite_pos_ic_4w:.1%}")
     if top_bottom_4w is not None:
         reasons.append(f"CompositeScore 4W top-minus-bottom return spread is {top_bottom_4w:.2%}")
+    if signal_model_decision:
+        reasons.append(f"Signal model decision is {signal_model_decision}")
+    if momentum_vs_composite is not None:
+        if momentum_vs_composite > 1e-6:
+            reasons.append("MomentumScore beats the current composite score on excess Sharpe")
+        elif momentum_vs_composite < -1e-6:
+            reasons.append("MomentumScore loses to the current composite score on excess Sharpe")
+        else:
+            reasons.append("MomentumScore ties the current composite score on excess Sharpe")
+    if rebalance_4w_vs_weekly is not None:
+        if rebalance_4w_vs_weekly > 1e-6:
+            reasons.append("4-week rebalance improves over weekly rebalance on excess Sharpe")
+        elif rebalance_4w_vs_weekly < -1e-6:
+            reasons.append("4-week rebalance loses to weekly rebalance on excess Sharpe")
+        else:
+            reasons.append("4-week rebalance ties weekly rebalance on excess Sharpe")
+    if rebalance_4w_turnover_delta is not None:
+        reasons.append(
+            f"4-week rebalance turnover delta versus weekly is {rebalance_4w_turnover_delta:.3f}"
+        )
+    if best_score_static_delta is not None:
+        if best_score_static_delta >= 0:
+            reasons.append("Best non-diagnostic score model beats StaticMatched EqualWeightRisk/Cash on excess Sharpe")
+        else:
+            reasons.append("Best non-diagnostic score model loses to StaticMatched EqualWeightRisk/Cash on excess Sharpe")
+    if best_score_same_delta is not None:
+        if best_score_same_delta >= 0:
+            reasons.append("Best non-diagnostic score model beats SameCashSchedule EqualWeightRisk on excess Sharpe")
+        else:
+            reasons.append("Best non-diagnostic score model loses to SameCashSchedule EqualWeightRisk on excess Sharpe")
     if candidate_mean_active_sharpe is not None:
         if candidate_mean_active_sharpe > 1e-6:
             reasons.append("Walk-forward candidate selection improves base on average test excess Sharpe")
@@ -1429,6 +1693,14 @@ def _classify_strategy(summary: Dict[str, object]) -> Tuple[str, List[str]]:
         and selected_static_sharpe_delta >= 0
         and selected_same_cash_sharpe_delta is not None
         and selected_same_cash_sharpe_delta >= 0
+        and signal_decision == "SIGNALS_HAVE_PREDICTIVE_VALUE"
+        and wf_signal_model_negative_folds == 0
+        and best_score_static_delta is not None
+        and best_score_static_delta >= 0
+        and best_score_same_delta is not None
+        and best_score_same_delta >= 0
+        and best_score_dd_reduction is not None
+        and best_score_dd_reduction >= DECISION_MATERIAL_DD_REDUCTION
         and negative_folds == 0
         and candidate_negative_folds == 0
         and random_beat_base_rate_sharpe is not None
@@ -1471,7 +1743,9 @@ def _robustness_decision_summary(
     benchmarks = tables["benchmarks"]
     walk_forward = tables["walk_forward"]
     walkforward_candidate = tables.get("walkforward_candidate_selection", pd.DataFrame())
+    walkforward_signal_model = tables.get("walkforward_signal_model_selection", pd.DataFrame())
     parameter_sweep = tables["parameter_sweep"]
+    signal_model_variants = tables.get("signal_model_variants", pd.DataFrame())
     random_null = tables.get("random_null_model", pd.DataFrame())
 
     ew = _first_ok_row(active, "Benchmark", "EqualWeightRisk")
@@ -1501,6 +1775,11 @@ def _robustness_decision_summary(
         walkforward_candidate["SelectedVariant"].astype(str).value_counts().to_dict()
         if "SelectedVariant" in walkforward_candidate.columns
         else {}
+    )
+    wf_signal_model_sharpe = (
+        pd.to_numeric(walkforward_signal_model["Test_Sharpe_Excess"], errors="coerce").dropna()
+        if "Test_Sharpe_Excess" in walkforward_signal_model.columns
+        else pd.Series(dtype=float)
     )
 
     summary: Dict[str, object] = {
@@ -1551,6 +1830,18 @@ def _robustness_decision_summary(
         ),
         "WalkForwardCandidateMeanActiveCAGR": (
             float(wf_candidate_active_cagr.mean()) if not wf_candidate_active_cagr.empty else None
+        ),
+        "WalkForwardSignalModelNegativeFoldCount": (
+            int((wf_signal_model_sharpe < 0).sum()) if not wf_signal_model_sharpe.empty else 0
+        ),
+        "WalkForwardSignalModelWorstSharpe": (
+            float(wf_signal_model_sharpe.min()) if not wf_signal_model_sharpe.empty else None
+        ),
+        "WalkForwardSignalModelMedianSharpe": (
+            float(wf_signal_model_sharpe.median()) if not wf_signal_model_sharpe.empty else None
+        ),
+        "WalkForwardSignalModelMeanSharpe": (
+            float(wf_signal_model_sharpe.mean()) if not wf_signal_model_sharpe.empty else None
         ),
     }
     if signal_summary:
@@ -2017,6 +2308,124 @@ def _robustness_decision_summary(
         }
     )
 
+    signal_rows = signal_model_variants.copy()
+    if not signal_rows.empty:
+        for col in ["Sharpe_Excess", "CAGR", "MaxDrawdown", "AvgWeeklyTurnover"]:
+            if col in signal_rows.columns:
+                signal_rows[col] = pd.to_numeric(signal_rows[col], errors="coerce")
+
+    signal_candidate_rows = signal_rows[
+        (signal_rows.get("VariantRole", "") == "CANDIDATE")
+        & signal_rows.get("Sharpe_Excess", pd.Series(dtype=float)).notna()
+    ].copy()
+    best_score_model = (
+        signal_candidate_rows.loc[signal_candidate_rows["Sharpe_Excess"].idxmax()]
+        if not signal_candidate_rows.empty
+        else None
+    )
+    best_score_sharpe = _variant_value(best_score_model, "Sharpe_Excess")
+    best_score_cagr = _variant_value(best_score_model, "CAGR")
+    best_score_maxdd = _variant_value(best_score_model, "MaxDrawdown")
+    best_score_turnover = _variant_value(best_score_model, "AvgWeeklyTurnover")
+    base_strategy_sharpe = _metric_value(baseline.stats.get("Sharpe_Excess"))
+    base_strategy_cagr = _metric_value(baseline.stats.get("CAGR"))
+    base_strategy_maxdd = _metric_value(baseline.stats.get("MaxDrawdown"))
+
+    score_model_current = _first_ok_row(parameter_sweep, "Label", "ScoreModel_CurrentComposite")
+    score_model_momentum = _first_ok_row(parameter_sweep, "Label", "ScoreModel_MomentumOnly")
+    rebalance_weekly = _first_ok_row(parameter_sweep, "Label", "Rebalance_Weekly")
+    rebalance_4w = _first_ok_row(parameter_sweep, "Label", "Rebalance_4W")
+    rebalance_rows = signal_candidate_rows[
+        signal_candidate_rows.get("VariantName", "").astype(str).str.startswith("Rebalance_")
+    ].copy()
+    best_rebalance = (
+        rebalance_rows.loc[rebalance_rows["Sharpe_Excess"].idxmax()]
+        if not rebalance_rows.empty
+        else None
+    )
+
+    best_score_static_delta = (
+        best_score_sharpe - static_ew_sharpe
+        if best_score_sharpe is not None and static_ew_sharpe is not None
+        else None
+    )
+    best_score_same_delta = (
+        best_score_sharpe - same_ew_sharpe
+        if best_score_sharpe is not None and same_ew_sharpe is not None
+        else None
+    )
+    best_score_ew_dd_reduction = (
+        _row_metric(ew, "Benchmark_MaxDD") - best_score_maxdd
+        if best_score_maxdd is not None and _row_metric(ew, "Benchmark_MaxDD") is not None
+        else None
+    )
+    momentum_vs_composite = _variant_delta(
+        score_model_momentum, score_model_current, "Sharpe_Excess"
+    )
+    rebalance_4w_vs_weekly = _variant_delta(rebalance_4w, rebalance_weekly, "Sharpe_Excess")
+    rebalance_4w_turnover_delta = _variant_delta(
+        rebalance_4w, rebalance_weekly, "AvgWeeklyTurnover"
+    )
+
+    best_score_name = (
+        best_score_model.get("VariantName") if best_score_model is not None else None
+    )
+    if best_score_model is None:
+        signal_model_decision = "INSUFFICIENT_DATA"
+    elif best_score_sharpe is not None and base_strategy_sharpe is not None and best_score_sharpe <= base_strategy_sharpe:
+        signal_model_decision = "SCORE_MODELS_FAIL_TO_IMPROVE"
+    elif best_score_name and "ICWeighted" in str(best_score_name):
+        signal_model_decision = "IC_WEIGHTED_MODEL_IMPROVES_STRATEGY"
+    elif momentum_vs_composite is not None and momentum_vs_composite > 0:
+        signal_model_decision = "MOMENTUM_ONLY_BEATS_COMPOSITE"
+    elif rebalance_4w_vs_weekly is not None and rebalance_4w_vs_weekly > 0:
+        signal_model_decision = "HORIZON_ALIGNED_REBALANCE_IMPROVES_STRATEGY"
+    else:
+        signal_model_decision = "SCORE_MODEL_IMPROVES_STRATEGY"
+
+    summary.update(
+        {
+            "BestScoreModel": best_score_name,
+            "BestScoreModel_Sharpe_Excess": best_score_sharpe,
+            "BestScoreModel_CAGR": best_score_cagr,
+            "BestScoreModel_MaxDD": best_score_maxdd,
+            "BestScoreModel_Turnover": best_score_turnover,
+            "BestScoreModel_vs_Base_Sharpe_Excess_Delta": (
+                best_score_sharpe - base_strategy_sharpe
+                if best_score_sharpe is not None and base_strategy_sharpe is not None
+                else None
+            ),
+            "BestScoreModel_vs_Base_CAGR_Delta": (
+                best_score_cagr - base_strategy_cagr
+                if best_score_cagr is not None and base_strategy_cagr is not None
+                else None
+            ),
+            "BestScoreModel_vs_Base_MaxDD_Reduction": (
+                base_strategy_maxdd - best_score_maxdd
+                if best_score_maxdd is not None and base_strategy_maxdd is not None
+                else None
+            ),
+            "BestScoreModel_vs_StaticMatched_Sharpe_Excess_Delta": (
+                best_score_static_delta
+            ),
+            "BestScoreModel_vs_SameCashSchedule_Sharpe_Excess_Delta": (
+                best_score_same_delta
+            ),
+            "BestScoreModel_vs_EqualWeightRisk_MaxDD_Reduction": (
+                best_score_ew_dd_reduction
+            ),
+            "BestRebalanceMode": (
+                best_rebalance.get("VariantName") if best_rebalance is not None else None
+            ),
+            "Rebalance4W_vs_Weekly_Sharpe_Excess_Delta": rebalance_4w_vs_weekly,
+            "Rebalance4W_vs_Weekly_Turnover_Delta": rebalance_4w_turnover_delta,
+            "MomentumOnly_vs_CurrentComposite_Sharpe_Excess_Delta": (
+                momentum_vs_composite
+            ),
+            "SignalModelDecision": signal_model_decision,
+        }
+    )
+
     decision, reasons = _classify_strategy(summary)
     summary["Decision"] = decision
     summary["Reason"] = reasons
@@ -2120,6 +2529,25 @@ def _write_summary_markdown(outdir: Path, summary: Dict[str, object]) -> None:
         f"- CompositeScore 4W positive IC rate: {_fmt_metric(summary.get('CompositeScore_PositiveICRate_4W'), pct=True)}",
         f"- CompositeScore 4W top-minus-bottom spread: {_fmt_metric(summary.get('TopBucketMinusBottomBucket_4W'), pct=True)}",
         "",
+        "## Signal Model Variants",
+        "",
+        f"- Signal model decision: {summary.get('SignalModelDecision')}",
+        f"- Best score model: {summary.get('BestScoreModel')}",
+        f"- Best score model excess Sharpe: {_fmt_metric(summary.get('BestScoreModel_Sharpe_Excess'))}",
+        f"- Best score model CAGR: {_fmt_metric(summary.get('BestScoreModel_CAGR'), pct=True)}",
+        f"- Best score model max drawdown: {_fmt_metric(summary.get('BestScoreModel_MaxDD'), pct=True)}",
+        f"- Best score model turnover: {_fmt_metric(summary.get('BestScoreModel_Turnover'))}",
+        f"- Best score model vs base Sharpe delta: {_fmt_metric(summary.get('BestScoreModel_vs_Base_Sharpe_Excess_Delta'))}",
+        f"- Best score model vs static matched Sharpe delta: {_fmt_metric(summary.get('BestScoreModel_vs_StaticMatched_Sharpe_Excess_Delta'))}",
+        f"- Best score model vs same-cash Sharpe delta: {_fmt_metric(summary.get('BestScoreModel_vs_SameCashSchedule_Sharpe_Excess_Delta'))}",
+        f"- Best rebalance mode: {summary.get('BestRebalanceMode')}",
+        f"- Rebalance 4W vs weekly Sharpe delta: {_fmt_metric(summary.get('Rebalance4W_vs_Weekly_Sharpe_Excess_Delta'))}",
+        f"- Rebalance 4W vs weekly turnover delta: {_fmt_metric(summary.get('Rebalance4W_vs_Weekly_Turnover_Delta'))}",
+        f"- Walk-forward signal-model negative folds: {summary.get('WalkForwardSignalModelNegativeFoldCount')}",
+        f"- Walk-forward signal-model worst Sharpe: {_fmt_metric(summary.get('WalkForwardSignalModelWorstSharpe'))}",
+        f"- Walk-forward signal-model median Sharpe: {_fmt_metric(summary.get('WalkForwardSignalModelMedianSharpe'))}",
+        f"- Walk-forward signal-model mean Sharpe: {_fmt_metric(summary.get('WalkForwardSignalModelMeanSharpe'))}",
+        "",
         "## Benchmarks",
         "",
         f"- Best by excess Sharpe: {summary.get('BestBenchmarkBySharpe')}",
@@ -2154,11 +2582,16 @@ def _write_summary_markdown(outdir: Path, summary: Dict[str, object]) -> None:
 def _robustness_variants(
     base_config: MatvmConfig,
     baseline_avg_cash_weight: Optional[float] = None,
+    static_ic_weights: Optional[Dict[str, float]] = None,
+    nonnegative_ic_weights: Optional[Dict[str, float]] = None,
 ) -> List[Tuple[str, MatvmConfig]]:
     avg_cash = 0.0 if baseline_avg_cash_weight is None else float(baseline_avg_cash_weight)
     avg_cash = min(max(avg_cash, 0.0), 1.0)
+    static_ic_weights = dict(static_ic_weights or {"MomentumScore": 1.0})
+    nonnegative_ic_weights = dict(nonnegative_ic_weights or {"MomentumScore": 1.0})
     definitions: List[Tuple[str, Dict[str, object]]] = [
         ("baseline", {}),
+        ("Rebalance_Weekly", {"rebalance_freq": "W-FRI"}),
         (
             "NoCashTiming_StaticAverageCash",
             {"cash_policy": "fixed", "fixed_cash_weight": avg_cash},
@@ -2276,6 +2709,107 @@ def _robustness_variants(
                 "asset_selection_seed": 5,
             },
         ),
+        (
+            "ScoreModel_CurrentComposite",
+            {
+                "cash_policy": "fixed",
+                "fixed_cash_weight": avg_cash,
+                "asset_selection_mode": "base",
+                "score_model": "current_composite",
+            },
+        ),
+        (
+            "ScoreModel_MomentumOnly",
+            {
+                "cash_policy": "fixed",
+                "fixed_cash_weight": avg_cash,
+                "asset_selection_mode": "score_model",
+                "score_model": "momentum_only",
+            },
+        ),
+        (
+            "ScoreModel_RiskAdjustedMomentumOnly",
+            {
+                "cash_policy": "fixed",
+                "fixed_cash_weight": avg_cash,
+                "asset_selection_mode": "score_model",
+                "score_model": "risk_adjusted_momentum_only",
+            },
+        ),
+        (
+            "ScoreModel_MomentumPlusTrend",
+            {
+                "cash_policy": "fixed",
+                "fixed_cash_weight": avg_cash,
+                "asset_selection_mode": "score_model",
+                "score_model": "momentum_plus_trend",
+            },
+        ),
+        (
+            "ScoreModel_MomentumMinusVolatility",
+            {
+                "cash_policy": "fixed",
+                "fixed_cash_weight": avg_cash,
+                "asset_selection_mode": "score_model",
+                "score_model": "momentum_minus_volatility",
+            },
+        ),
+        (
+            "ScoreModel_MomentumTrendMinusVolatility",
+            {
+                "cash_policy": "fixed",
+                "fixed_cash_weight": avg_cash,
+                "asset_selection_mode": "score_model",
+                "score_model": "momentum_trend_minus_volatility",
+            },
+        ),
+        (
+            "ScoreModel_ICWeightedComposite_Static",
+            {
+                "cash_policy": "fixed",
+                "fixed_cash_weight": avg_cash,
+                "asset_selection_mode": "score_model",
+                "score_model": "ic_weighted_composite_static",
+                "score_model_weights": static_ic_weights,
+            },
+        ),
+        (
+            "ScoreModel_ICWeightedComposite_NonNegative",
+            {
+                "cash_policy": "fixed",
+                "fixed_cash_weight": avg_cash,
+                "asset_selection_mode": "score_model",
+                "score_model": "ic_weighted_composite_nonnegative",
+                "score_model_weights": nonnegative_ic_weights,
+            },
+        ),
+        (
+            "ScoreModel_TopBucketEqualWeight",
+            {
+                "cash_policy": "fixed",
+                "fixed_cash_weight": avg_cash,
+                "asset_selection_mode": "score_model",
+                "score_model": "top_bucket_equal_weight",
+            },
+        ),
+        (
+            "ScoreModel_RankWeightedTopK",
+            {
+                "cash_policy": "fixed",
+                "fixed_cash_weight": avg_cash,
+                "asset_selection_mode": "score_model",
+                "score_model": "rank_weighted_top_k",
+            },
+        ),
+        (
+            "ScoreModel_ScoreWeightedTopK",
+            {
+                "cash_policy": "fixed",
+                "fixed_cash_weight": avg_cash,
+                "asset_selection_mode": "score_model",
+                "score_model": "score_weighted_top_k",
+            },
+        ),
         ("vol_window_40", {"vol_window": 40}),
         ("vol_window_90", {"vol_window": 90}),
         ("sma_window_150", {"sma_window": 150}),
@@ -2292,6 +2826,33 @@ def _robustness_variants(
         ("breadth_min_4", {"breadth_min": 4}),
         ("rebalance_2w", {"rebalance_freq": "2W-FRI"}),
         ("rebalance_month_end", {"rebalance_freq": "ME"}),
+        ("Rebalance_2W", {"rebalance_freq": "2W-FRI"}),
+        ("Rebalance_4W", {"rebalance_freq": "4W-FRI"}),
+        (
+            "Rebalance_4W_MomentumOnly",
+            {
+                "rebalance_freq": "4W-FRI",
+                "asset_selection_mode": "score_model",
+                "score_model": "momentum_only",
+            },
+        ),
+        (
+            "Rebalance_4W_ICWeighted",
+            {
+                "rebalance_freq": "4W-FRI",
+                "asset_selection_mode": "score_model",
+                "score_model": "ic_weighted_composite_nonnegative",
+                "score_model_weights": nonnegative_ic_weights,
+            },
+        ),
+        (
+            "Rebalance_4W_RankWeightedTopK",
+            {
+                "rebalance_freq": "4W-FRI",
+                "asset_selection_mode": "score_model",
+                "score_model": "rank_weighted_top_k",
+            },
+        ),
     ]
     return [(name, _clone_config(base_config, **updates)) for name, updates in definitions]
 
@@ -2345,6 +2906,10 @@ def _precompute_variant_results(
 def _variant_group(name: str) -> str:
     if name == "baseline":
         return "DynamicCashTiming"
+    if name.startswith("ScoreModel_"):
+        return "ScoreModel"
+    if name.startswith("Rebalance_"):
+        return "Rebalance"
     if name.startswith("NoCashTiming_"):
         return "NoCashTiming"
     if name.startswith("CashTiming_ThresholdSweep"):
@@ -2356,6 +2921,8 @@ def _variant_group(name: str) -> str:
 
 def _variant_role(name: str) -> str:
     if name.startswith("AssetSelection_RandomSameCashSeed_"):
+        return "DIAGNOSTIC_ONLY"
+    if "ICWeighted" in name:
         return "DIAGNOSTIC_ONLY"
     return "CANDIDATE"
 
@@ -2381,14 +2948,24 @@ def _parameter_sweep_table(
         }
         if cfg is not None:
             avg_cash = _variant_avg_cash_weight(res, cfg)
+            percent_time_in_cash = (
+                float((res.weights[cfg.cash_ticker] > 1e-6).mean())
+                if cfg.cash_ticker in res.weights.columns and not res.weights.empty
+                else np.nan
+            )
             extra.update(
                 {
                     "CashPolicy": cfg.cash_policy,
                     "FixedCashWeight": cfg.fixed_cash_weight,
                     "AvgCashWeight": avg_cash,
                     "AvgRiskWeight": 1.0 - avg_cash if not np.isnan(avg_cash) else np.nan,
+                    "PercentTimeInCash": percent_time_in_cash,
                     "AssetSelectionMode": cfg.asset_selection_mode,
                     "AssetSelectionSeed": cfg.asset_selection_seed,
+                    "ScoreModel": cfg.score_model,
+                    "ScoreModelWeights": json.dumps(_json_value(cfg.score_model_weights), sort_keys=True),
+                    "RebalanceMode": cfg.rebalance_freq,
+                    "AvgWeeklyTurnover": res.stats.get("AvgWeeklyTurnover"),
                     "DDHalf": cfg.dd_half,
                     "DDSafe": cfg.dd_safe,
                     "DDExit": cfg.dd_exit,
@@ -2404,6 +2981,38 @@ def _parameter_sweep_table(
         )
         rows.append(row)
     return pd.DataFrame(rows).sort_values("Sharpe_Excess", ascending=False, na_position="last")
+
+
+def _signal_model_variants_table(parameter_sweep: pd.DataFrame) -> pd.DataFrame:
+    columns = [
+        "VariantName",
+        "VariantRole",
+        "ScoreModel",
+        "RebalanceMode",
+        "CAGR",
+        "MaxDrawdown",
+        "Sharpe_RF0",
+        "Sharpe_Excess",
+        "Sortino_RF0",
+        "Sortino_Excess",
+        "Calmar",
+        "AvgWeeklyTurnover",
+        "AvgCashWeight",
+        "PercentTimeInCash",
+    ]
+    if parameter_sweep.empty:
+        return pd.DataFrame(columns=columns)
+    rows = parameter_sweep[
+        parameter_sweep.get("VariantGroup", "").isin(["ScoreModel", "Rebalance"])
+        | parameter_sweep.get("Label", "").isin(["baseline", "Rebalance_Weekly"])
+    ].copy()
+    if rows.empty:
+        return pd.DataFrame(columns=columns)
+    rows["VariantName"] = rows["Label"]
+    for col in columns:
+        if col not in rows.columns:
+            rows[col] = np.nan
+    return rows[columns].sort_values("Sharpe_Excess", ascending=False, na_position="last")
 
 
 def _regime_table(
@@ -3187,6 +3796,7 @@ def _signal_values_for_date(
         asof=asof,
         q=q,
         sigma=sigma,
+        sma200=sma200,
         trend=p0 > sma200,
         e_hyst=e_hyst,
     ).reindex(config.risk_tickers).fillna(0.0)
@@ -3540,6 +4150,101 @@ def _signal_predictive_summary(
 
     summary["SignalPredictiveDecision"] = decision
     return {str(k): _json_value(v) for k, v in summary.items()}
+
+
+def _ic_weight_map(
+    ic_summary: pd.DataFrame,
+    horizon: str = "4W",
+    nonnegative: bool = False,
+) -> Dict[str, float]:
+    if ic_summary.empty:
+        return {"MomentumScore": 1.0}
+    rows = ic_summary[
+        (ic_summary.get("Horizon", "") == horizon)
+        & (ic_summary.get("SignalName", "").isin(SCORE_MODEL_COMPONENTS))
+    ].copy()
+    if rows.empty:
+        return {"MomentumScore": 1.0}
+    rows["MeanRankIC"] = pd.to_numeric(rows["MeanRankIC"], errors="coerce")
+    rows = rows.dropna(subset=["MeanRankIC"])
+    if rows.empty:
+        return {"MomentumScore": 1.0}
+
+    weights: Dict[str, float] = {}
+    for _, row in rows.iterrows():
+        value = float(row["MeanRankIC"])
+        if nonnegative:
+            value = max(0.0, value)
+        weights[str(row["SignalName"])] = value
+
+    denom = sum(weights.values()) if nonnegative else sum(abs(v) for v in weights.values())
+    if denom <= 1e-12:
+        return {"MomentumScore": 1.0}
+    return {name: float(value / denom) for name, value in weights.items()}
+
+
+def _score_model_rank_ic_for_prices(
+    prices: pd.DataFrame,
+    config: MatvmConfig,
+    score_model: str,
+    horizon: str = "4W",
+) -> Tuple[Optional[float], Optional[float]]:
+    horizon_days = dict(SIGNAL_FORWARD_HORIZONS).get(horizon)
+    if horizon_days is None:
+        return None, None
+
+    cfg = _clone_config(config, asset_selection_mode="score_model", score_model=score_model)
+    strategy = MatvmStrategy(config=cfg)
+    prices = _ensure_datetime_index(prices).sort_index()
+    signal_dates = pd.DatetimeIndex(
+        prices.index.to_series().resample(cfg.rebalance_freq).last().dropna().values
+    ).intersection(prices.index)
+
+    ics: List[float] = []
+    for signal_date in signal_dates:
+        if len(prices.loc[:signal_date]) < cfg.required_history_days():
+            continue
+        try:
+            q, sigma, sma200 = strategy._compute_q_scores(prices, signal_date)
+            p0 = prices.loc[signal_date, cfg.risk_tickers]
+            e_raw = ((q > 0.0) & (p0 > sma200)).astype(int)
+            e_hyst = strategy._update_hysteresis(e_raw)
+            scores = strategy._score_model_series(
+                prices=prices,
+                asof=signal_date,
+                q=q,
+                sigma=sigma,
+                sma200=sma200,
+                e_hyst=e_hyst,
+            )
+        except Exception:
+            continue
+
+        forward = pd.Series(
+            {
+                ticker: _forward_return_from_next_close(
+                    prices=prices,
+                    signal_date=signal_date,
+                    ticker=ticker,
+                    horizon_days=horizon_days,
+                )
+                for ticker in cfg.risk_tickers
+            },
+            dtype=float,
+        )
+        subset = pd.DataFrame({"score": scores, "forward": forward}).dropna()
+        if len(subset) < 3 or subset["score"].nunique() < 2 or subset["forward"].nunique() < 2:
+            continue
+        ic = subset["score"].rank(method="average").corr(
+            subset["forward"].rank(method="average")
+        )
+        if not pd.isna(ic):
+            ics.append(float(ic))
+
+    if not ics:
+        return None, None
+    values = pd.Series(ics, dtype=float)
+    return float(values.mean()), float((values > 0.0).mean())
 
 
 def _signal_diagnostic_tables(
@@ -4016,6 +4721,341 @@ def _walk_forward_candidate_selection_table(
     return pd.DataFrame(rows)
 
 
+def _test_benchmark_stats(
+    prices: pd.DataFrame,
+    config: MatvmConfig,
+    baseline: BacktestResult,
+    daily_rf: pd.Series,
+    test_index: pd.DatetimeIndex,
+) -> Dict[str, Dict[str, float]]:
+    out: Dict[str, Dict[str, float]] = {}
+    for result in _benchmark_results(prices, config, daily_rf, baseline=baseline):
+        label = str(result.get("label"))
+        equity = result.get("equity")
+        if not isinstance(equity, pd.Series):
+            continue
+        idx = test_index.intersection(equity.index)
+        if len(idx) < 2:
+            continue
+        out[label] = _stats_from_equity(equity.loc[idx], daily_rf=daily_rf.reindex(idx).fillna(0.0))
+    return out
+
+
+def _signal_model_candidate_definitions(
+    base_config: MatvmConfig,
+    avg_cash_weight: float,
+    ic_weights: Optional[Dict[str, float]] = None,
+) -> List[Tuple[str, MatvmConfig]]:
+    avg_cash_weight = min(max(float(avg_cash_weight), 0.0), 1.0)
+    ic_weights = dict(ic_weights or {"MomentumScore": 1.0})
+    return [
+        (
+            "ScoreModel_CurrentComposite",
+            _clone_config(
+                base_config,
+                cash_policy="fixed",
+                fixed_cash_weight=avg_cash_weight,
+                asset_selection_mode="base",
+                score_model="current_composite",
+            ),
+        ),
+        (
+            "ScoreModel_MomentumOnly",
+            _clone_config(
+                base_config,
+                cash_policy="fixed",
+                fixed_cash_weight=avg_cash_weight,
+                asset_selection_mode="score_model",
+                score_model="momentum_only",
+            ),
+        ),
+        (
+            "ScoreModel_RiskAdjustedMomentumOnly",
+            _clone_config(
+                base_config,
+                cash_policy="fixed",
+                fixed_cash_weight=avg_cash_weight,
+                asset_selection_mode="score_model",
+                score_model="risk_adjusted_momentum_only",
+            ),
+        ),
+        (
+            "ScoreModel_MomentumPlusTrend",
+            _clone_config(
+                base_config,
+                cash_policy="fixed",
+                fixed_cash_weight=avg_cash_weight,
+                asset_selection_mode="score_model",
+                score_model="momentum_plus_trend",
+            ),
+        ),
+        (
+            "ScoreModel_MomentumMinusVolatility",
+            _clone_config(
+                base_config,
+                cash_policy="fixed",
+                fixed_cash_weight=avg_cash_weight,
+                asset_selection_mode="score_model",
+                score_model="momentum_minus_volatility",
+            ),
+        ),
+        (
+            "ScoreModel_MomentumTrendMinusVolatility",
+            _clone_config(
+                base_config,
+                cash_policy="fixed",
+                fixed_cash_weight=avg_cash_weight,
+                asset_selection_mode="score_model",
+                score_model="momentum_trend_minus_volatility",
+            ),
+        ),
+        (
+            "ScoreModel_TopBucketEqualWeight",
+            _clone_config(
+                base_config,
+                cash_policy="fixed",
+                fixed_cash_weight=avg_cash_weight,
+                asset_selection_mode="score_model",
+                score_model="top_bucket_equal_weight",
+            ),
+        ),
+        (
+            "ScoreModel_RankWeightedTopK",
+            _clone_config(
+                base_config,
+                cash_policy="fixed",
+                fixed_cash_weight=avg_cash_weight,
+                asset_selection_mode="score_model",
+                score_model="rank_weighted_top_k",
+            ),
+        ),
+        (
+            "ScoreModel_ScoreWeightedTopK",
+            _clone_config(
+                base_config,
+                cash_policy="fixed",
+                fixed_cash_weight=avg_cash_weight,
+                asset_selection_mode="score_model",
+                score_model="score_weighted_top_k",
+            ),
+        ),
+        (
+            "ScoreModel_ICWeightedComposite_NonNegative",
+            _clone_config(
+                base_config,
+                cash_policy="fixed",
+                fixed_cash_weight=avg_cash_weight,
+                asset_selection_mode="score_model",
+                score_model="ic_weighted_composite_nonnegative",
+                score_model_weights=ic_weights,
+            ),
+        ),
+        (
+            "Rebalance_4W_MomentumOnly",
+            _clone_config(
+                base_config,
+                rebalance_freq="4W-FRI",
+                asset_selection_mode="score_model",
+                score_model="momentum_only",
+            ),
+        ),
+        (
+            "Rebalance_4W_ICWeighted",
+            _clone_config(
+                base_config,
+                rebalance_freq="4W-FRI",
+                asset_selection_mode="score_model",
+                score_model="ic_weighted_composite_nonnegative",
+                score_model_weights=ic_weights,
+            ),
+        ),
+        (
+            "Rebalance_4W_RankWeightedTopK",
+            _clone_config(
+                base_config,
+                rebalance_freq="4W-FRI",
+                asset_selection_mode="score_model",
+                score_model="rank_weighted_top_k",
+            ),
+        ),
+    ]
+
+
+def _walkforward_signal_model_selection_table(
+    prices: pd.DataFrame,
+    config: MatvmConfig,
+    daily_rf: pd.Series,
+    initial_capital: float,
+    min_test_days: int = 126,
+) -> pd.DataFrame:
+    rows: List[Dict[str, object]] = []
+    data_start = prices.index[0]
+    data_end = prices.index[-1]
+    fold_train_start = data_start
+    fold_num = 1
+
+    while True:
+        train_end = fold_train_start + pd.DateOffset(years=2) - pd.DateOffset(days=1)
+        test_start = train_end + pd.DateOffset(days=1)
+        test_end = min(test_start + pd.DateOffset(years=1) - pd.DateOffset(days=1), data_end)
+        if test_start >= data_end or train_end >= data_end:
+            break
+        if len(prices.loc[test_start:test_end]) < min_test_days:
+            break
+
+        train_prices = prices.loc[fold_train_start:train_end].copy()
+        if len(train_prices) < config.required_history_days() + 20:
+            fold_train_start = fold_train_start + pd.DateOffset(years=1)
+            fold_num += 1
+            continue
+
+        train_baseline = backtest(train_prices, config=config, initial_capital=initial_capital)
+        train_avg_cash = _variant_avg_cash_weight(train_baseline, config)
+        train_signal_tables, _train_signal_summary = _signal_diagnostic_tables(
+            prices=train_prices,
+            config=config,
+            baseline=train_baseline,
+        )
+        train_ic_weights = _ic_weight_map(
+            train_signal_tables.get("signal_ic_summary", pd.DataFrame()),
+            horizon="4W",
+            nonnegative=True,
+        )
+
+        scored: List[Tuple[float, str, MatvmConfig, Dict[str, float], Optional[float], Optional[float]]] = []
+        for name, candidate_cfg in _signal_model_candidate_definitions(
+            base_config=config,
+            avg_cash_weight=train_avg_cash,
+            ic_weights=train_ic_weights,
+        ):
+            train_res = backtest(train_prices, config=candidate_cfg, initial_capital=initial_capital)
+            train_stats = _stats_from_equity(
+                train_res.equity_curve,
+                daily_rf=daily_rf.reindex(train_res.equity_curve.index).fillna(0.0),
+            )
+            score_value = _metric_value(train_stats.get("Sharpe_Excess"))
+            mean_ic, pos_ic = _score_model_rank_ic_for_prices(
+                prices=train_prices,
+                config=candidate_cfg,
+                score_model=candidate_cfg.score_model,
+                horizon="4W",
+            )
+            scored.append(
+                (
+                    -1e9 if score_value is None else score_value,
+                    name,
+                    candidate_cfg,
+                    train_stats,
+                    mean_ic,
+                    pos_ic,
+                )
+            )
+
+        if not scored:
+            break
+
+        scored.sort(reverse=True, key=lambda item: item[0])
+        _score, selected_name, selected_cfg, selected_train_stats, train_mean_ic, train_pos_ic = scored[0]
+
+        eval_prices = prices.loc[fold_train_start:test_end].copy()
+        selected_res = backtest(eval_prices, config=selected_cfg, initial_capital=initial_capital)
+        base_res = backtest(eval_prices, config=config, initial_capital=initial_capital)
+        idx = selected_res.equity_curve.loc[test_start:test_end].index.intersection(
+            base_res.equity_curve.loc[test_start:test_end].index
+        )
+        if len(idx) < 2:
+            break
+
+        rf = daily_rf.reindex(idx).fillna(0.0)
+        test_equity = selected_res.equity_curve.loc[idx]
+        base_equity = base_res.equity_curve.loc[idx]
+        test_stats = _stats_from_equity(test_equity, daily_rf=rf)
+        base_stats = _stats_from_equity(base_equity, daily_rf=rf)
+        benchmark_stats = _test_benchmark_stats(
+            prices=eval_prices,
+            config=config,
+            baseline=base_res,
+            daily_rf=daily_rf.reindex(eval_prices.index).fillna(0.0),
+            test_index=idx,
+        )
+        same_stats = benchmark_stats.get("SameCashSchedule_EqualWeightRisk", {})
+        static_stats = benchmark_stats.get("StaticMatched_EqualWeightRisk_Cash", {})
+        ew_stats = benchmark_stats.get("EqualWeightRisk", {})
+        vol_stats = {
+            label: stats
+            for label, stats in benchmark_stats.items()
+            if label.startswith("VolTarget_VTI_Cash_")
+        }
+        best_vol_label = None
+        best_vol_sharpe = None
+        if vol_stats:
+            best_vol_label, best_vol = max(
+                vol_stats.items(),
+                key=lambda item: _safe_float(item[1].get("Sharpe_Excess"), default=-1e9),
+            )
+            best_vol_sharpe = _metric_value(best_vol.get("Sharpe_Excess"))
+
+        test_trades = selected_res.trades.loc[idx[0] : idx[-1]] if not selected_res.trades.empty else pd.DataFrame()
+        test_turnover = (
+            float(test_trades["turnover"].mean())
+            if not test_trades.empty and "turnover" in test_trades.columns
+            else 0.0
+        )
+
+        selected_label = SCORE_MODEL_LABELS.get(selected_cfg.score_model, selected_cfg.score_model)
+        rows.append(
+            {
+                "Fold": f"fold_{fold_num}",
+                "TrainStart": str(fold_train_start.date()),
+                "TrainEnd": str(train_end.date()),
+                "TestStart": str(idx[0].date()),
+                "TestEnd": str(idx[-1].date()),
+                "SelectedScoreModel": selected_label,
+                "SelectedVariant": selected_name,
+                "SelectedRebalanceMode": selected_cfg.rebalance_freq,
+                "Train_MeanIC_4W": train_mean_ic,
+                "Train_PositiveICRate_4W": train_pos_ic,
+                "Train_CAGR": selected_train_stats.get("CAGR"),
+                "Train_MaxDD": selected_train_stats.get("MaxDrawdown"),
+                "Train_Sharpe_Excess": selected_train_stats.get("Sharpe_Excess"),
+                "Test_CAGR": test_stats.get("CAGR"),
+                "Test_MaxDD": test_stats.get("MaxDrawdown"),
+                "Test_Sharpe_Excess": test_stats.get("Sharpe_Excess"),
+                "Test_Calmar": test_stats.get("Calmar"),
+                "Test_Turnover": test_turnover,
+                "Test_ActiveSharpe_vs_Base": (
+                    test_stats.get("Sharpe_Excess") - base_stats.get("Sharpe_Excess")
+                ),
+                "Test_ActiveSharpe_vs_SameCashSchedule": (
+                    test_stats.get("Sharpe_Excess") - same_stats.get("Sharpe_Excess")
+                    if same_stats.get("Sharpe_Excess") is not None
+                    else None
+                ),
+                "Test_ActiveSharpe_vs_StaticMatched": (
+                    test_stats.get("Sharpe_Excess") - static_stats.get("Sharpe_Excess")
+                    if static_stats.get("Sharpe_Excess") is not None
+                    else None
+                ),
+                "Test_ActiveSharpe_vs_BestVolTarget": (
+                    test_stats.get("Sharpe_Excess") - best_vol_sharpe
+                    if best_vol_sharpe is not None
+                    else None
+                ),
+                "BestVolTargetBenchmark": best_vol_label,
+                "Test_DrawdownReduction_vs_EqualWeightRisk": (
+                    ew_stats.get("MaxDrawdown") - test_stats.get("MaxDrawdown")
+                    if ew_stats.get("MaxDrawdown") is not None
+                    else None
+                ),
+            }
+        )
+
+        fold_train_start = fold_train_start + pd.DateOffset(years=1)
+        fold_num += 1
+
+    return pd.DataFrame(rows)
+
+
 def run_robustness_analysis(
     prices: pd.DataFrame,
     config: MatvmConfig,
@@ -4034,17 +5074,28 @@ def run_robustness_analysis(
 
     baseline = backtest(prices=prices, config=config, initial_capital=initial_capital)
     baseline_avg_cash = _variant_avg_cash_weight(baseline, config)
-    variants = _robustness_variants(config, baseline_avg_cash_weight=baseline_avg_cash)
+    signal_tables, signal_summary = _signal_diagnostic_tables(
+        prices=prices,
+        config=config,
+        baseline=baseline,
+    )
+    signal_ic_summary = signal_tables.get("signal_ic_summary", pd.DataFrame())
+    variants = _robustness_variants(
+        config,
+        baseline_avg_cash_weight=baseline_avg_cash,
+        static_ic_weights=_ic_weight_map(signal_ic_summary, horizon="4W", nonnegative=False),
+        nonnegative_ic_weights=_ic_weight_map(signal_ic_summary, horizon="4W", nonnegative=True),
+    )
     variant_configs = {name: cfg for name, cfg in variants}
     variant_results = _precompute_variant_results(
         prices=prices,
         variants=variants,
         initial_capital=initial_capital,
     )
-    signal_tables, signal_summary = _signal_diagnostic_tables(
-        prices=prices,
-        config=config,
-        baseline=baseline,
+    parameter_sweep = _parameter_sweep_table(
+        results=variant_results,
+        daily_rf=daily_rf,
+        variant_configs=variant_configs,
     )
 
     tables = {
@@ -4054,11 +5105,8 @@ def run_robustness_analysis(
             start_dates=start_dates,
             initial_capital=initial_capital,
         ),
-        "parameter_sweep": _parameter_sweep_table(
-            results=variant_results,
-            daily_rf=daily_rf,
-            variant_configs=variant_configs,
-        ),
+        "parameter_sweep": parameter_sweep,
+        "signal_model_variants": _signal_model_variants_table(parameter_sweep),
         "random_null_model": _random_null_model_table(
             prices=prices,
             config=config,
@@ -4095,6 +5143,12 @@ def run_robustness_analysis(
             prices=prices,
             daily_rf=daily_rf,
             score_metric=score_metric,
+        ),
+        "walkforward_signal_model_selection": _walkforward_signal_model_selection_table(
+            prices=prices,
+            config=config,
+            daily_rf=daily_rf,
+            initial_capital=initial_capital,
         ),
     }
     tables.update(signal_tables)
@@ -4875,6 +5929,13 @@ def cli_robustness(args: argparse.Namespace) -> None:
     print(f"{'Composite IC 4W':>22}: {_fmt_metric(summary.get('CompositeScore_MeanIC_4W'))}")
     print(f"{'Composite +IC 4W':>22}: {_fmt_metric(summary.get('CompositeScore_PositiveICRate_4W'), pct=True)}")
     print(f"{'Top-bottom 4W':>22}: {_fmt_metric(summary.get('TopBucketMinusBottomBucket_4W'), pct=True)}")
+    print(f"{'Signal model':>22}: {summary.get('SignalModelDecision')}")
+    print(f"{'Best score model':>22}: {summary.get('BestScoreModel')}")
+    print(f"{'Best score Sharpe':>22}: {_fmt_metric(summary.get('BestScoreModel_Sharpe_Excess'))}")
+    print(f"{'Best score vs base':>22}: {_fmt_metric(summary.get('BestScoreModel_vs_Base_Sharpe_Excess_Delta'))}")
+    print(f"{'Mom vs composite':>22}: {_fmt_metric(summary.get('MomentumOnly_vs_CurrentComposite_Sharpe_Excess_Delta'))}")
+    print(f"{'4W vs weekly':>22}: {_fmt_metric(summary.get('Rebalance4W_vs_Weekly_Sharpe_Excess_Delta'))}")
+    print(f"{'WF signal neg folds':>22}: {summary.get('WalkForwardSignalModelNegativeFoldCount')}")
     print(f"{'WF negative folds':>22}: {summary.get('WalkForwardNegativeFoldCount')}")
     print(f"{'WF cand neg folds':>22}: {summary.get('WalkForwardCandidateNegativeFoldCount')}")
     print(f"{'WF cand mean Sharpe':>22}: {_fmt_metric(summary.get('WalkForwardCandidateMeanSharpe'))}")
@@ -4918,6 +5979,8 @@ def cli_robustness(args: argparse.Namespace) -> None:
         "AvgCashWeight",
         "AssetSelectionMode",
         "AssetSelectionSeed",
+        "ScoreModel",
+        "RebalanceMode",
         "Status",
         "ActualStart",
         "ActualEnd",
