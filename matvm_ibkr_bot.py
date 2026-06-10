@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import dataclasses
 import json
 import math
@@ -127,7 +128,7 @@ def _ensure_datetime_index(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def simple_returns(prices: pd.DataFrame) -> pd.DataFrame:
-    return prices.pct_change().fillna(0.0)
+    return prices.pct_change(fill_method=None).fillna(0.0)
 
 
 def log_returns(prices: pd.DataFrame) -> pd.DataFrame:
@@ -5384,7 +5385,21 @@ class IbkrClient:
         self.cfg = cfg
         self.ib = None
 
+    @staticmethod
+    def _ensure_asyncio_event_loop() -> None:
+        try:
+            asyncio.get_running_loop()
+            return
+        except RuntimeError:
+            pass
+
+        try:
+            asyncio.get_event_loop()
+        except RuntimeError:
+            asyncio.set_event_loop(asyncio.new_event_loop())
+
     def connect(self):
+        self._ensure_asyncio_event_loop()
         try:
             from ib_insync import IB  # type: ignore
         except Exception as e:
@@ -5430,6 +5445,7 @@ class IbkrClient:
         raise RuntimeError("Could not read NetLiquidation from account values")
 
     def _contract_for_symbol(self, symbol: str):
+        self._ensure_asyncio_event_loop()
         from ib_insync import Stock  # type: ignore
 
         return Stock(symbol, self.cfg.exchange, self.cfg.currency)
@@ -5450,6 +5466,7 @@ class IbkrClient:
         """Fetch daily adjusted (if available) closes from IBKR."""
         assert self.ib is not None
 
+        self._ensure_asyncio_event_loop()
         from ib_insync import util  # type: ignore
 
         contracts = self.qualify_contracts(symbols)
@@ -5550,6 +5567,7 @@ class IbkrClient:
         assert self.ib is not None
 
         try:
+            self._ensure_asyncio_event_loop()
             from ib_insync import LimitOrder, MarketOrder  # type: ignore
         except Exception as e:
             raise RuntimeError("ib_insync not installed") from e

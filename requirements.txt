@@ -1,5 +1,5 @@
-numpy
-pandas
-matplotlib
-yfinance
-ib_insync
+ib-insync==0.9.86
+matplotlib==3.10.8
+numpy==2.4.0
+pandas==2.3.3
+yfinance==1.0
