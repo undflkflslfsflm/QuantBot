@@ -296,6 +296,7 @@ class StrategyState:
     held: Dict[str, int] = field(default_factory=dict)  # 1 if "eligible/held" via hysteresis
     enter_count: Dict[str, int] = field(default_factory=dict)
     exit_count: Dict[str, int] = field(default_factory=dict)
+    expected_positions: Dict[str, float] = field(default_factory=dict)
 
     # Safe mode latch
     safe_mode: bool = False
@@ -306,6 +307,12 @@ class StrategyState:
 
     # Last processed signal date
     last_signal_date: Optional[str] = None
+
+    # Last live rebalance bucket that submitted real orders
+    last_rebalance_period: Optional[str] = None
+
+    # True after a live run snapshots or records broker positions
+    positions_baseline_accepted: bool = False
 
     def ensure_assets(self, assets: Iterable[str]) -> None:
         for a in assets:
@@ -5224,10 +5231,18 @@ def load_state(path: Path) -> StrategyState:
     for k in ["held", "enter_count", "exit_count"]:
         if k in data and isinstance(data[k], dict):
             setattr(st, k, {str(kk): int(vv) for kk, vv in data[k].items()})
+    if "expected_positions" in data and isinstance(data["expected_positions"], dict):
+        st.expected_positions = {
+            str(kk): float(vv) for kk, vv in data["expected_positions"].items()
+        }
     st.safe_mode = bool(data.get("safe_mode", False))
     st.ramp_weeks_remaining = int(data.get("ramp_weeks_remaining", 0))
     st.breadth_good_count = int(data.get("breadth_good_count", 0))
     st.last_signal_date = data.get("last_signal_date")
+    st.last_rebalance_period = data.get("last_rebalance_period")
+    st.positions_baseline_accepted = bool(
+        data.get("positions_baseline_accepted", bool(st.expected_positions))
+    )
     return st
 
 
@@ -5237,10 +5252,13 @@ def save_state(path: Path, state: StrategyState) -> None:
         "held": state.held,
         "enter_count": state.enter_count,
         "exit_count": state.exit_count,
+        "expected_positions": state.expected_positions,
         "safe_mode": state.safe_mode,
         "ramp_weeks_remaining": state.ramp_weeks_remaining,
         "breadth_good_count": state.breadth_good_count,
         "last_signal_date": state.last_signal_date,
+        "last_rebalance_period": state.last_rebalance_period,
+        "positions_baseline_accepted": state.positions_baseline_accepted,
         "saved_at_utc": _dt_utc_now().isoformat(),
     }
     path.write_text(json.dumps(data, indent=2, sort_keys=True))
@@ -5356,7 +5374,7 @@ def load_prices_from_yfinance(
 
 
 # -----------------------------
-# IBKR integration (ib_insync)
+# IBKR integration (ib_async)
 # -----------------------------
 
 
@@ -5378,8 +5396,222 @@ class IbkrConfig:
     max_orders: int = 50
 
 
+class SafetyGateFailure(RuntimeError):
+    """Raised when a pre-trade safety check blocks live execution."""
+
+
+@dataclass
+class SafetyGateConfig:
+    max_stale_business_days: int = 3
+    allow_data_warnings: bool = True
+    position_tolerance_shares: float = 0.0
+    accept_positions: bool = False
+    force_rebalance: bool = False
+    max_order_notional_frac: float = 0.25
+    max_turnover_frac: float = 0.50
+    limit_price_max_deviation: float = 0.05
+
+
+def _normalize_position_map(positions: Dict[str, float]) -> Dict[str, float]:
+    out: Dict[str, float] = {}
+    for symbol, value in positions.items():
+        try:
+            qty = float(value)
+        except (TypeError, ValueError):
+            continue
+        if not np.isfinite(qty) or abs(qty) <= 1e-9:
+            continue
+        out[str(symbol).upper()] = qty
+    return out
+
+
+def _business_days_since(last_bar_date: pd.Timestamp, today: pd.Timestamp) -> int:
+    last = pd.Timestamp(last_bar_date)
+    if last.tzinfo is not None:
+        last = last.tz_convert(None)
+    current = pd.Timestamp(today)
+    if current.tzinfo is not None:
+        current = current.tz_convert(None)
+    last = last.normalize()
+    current = current.normalize()
+    if current <= last:
+        return 0
+    return int(len(pd.bdate_range(last + pd.offsets.BDay(1), current)))
+
+
+def rebalance_period_id(asof: pd.Timestamp, freq: str) -> str:
+    """Return a stable lock key for a signal date and rebalance frequency."""
+    asof_ts = pd.Timestamp(asof).normalize()
+    try:
+        return str(asof_ts.to_period(freq))
+    except Exception:
+        return f"{freq}:{asof_ts.to_period('W-FRI')}"
+
+
+class SafetyGate:
+    def __init__(self, config: SafetyGateConfig, state_dir: Path):
+        self.config = config
+        self.state_dir = Path(state_dir)
+
+    def _fail(self, message: str) -> None:
+        print(f"SAFETY CHECK FAILED: {message}", file=sys.stderr)
+        raise SafetyGateFailure(message)
+
+    def check_halt_file(self) -> None:
+        halt_path = self.state_dir / "HALT"
+        if halt_path.exists():
+            self._fail(
+                f"{halt_path} exists. Delete the HALT file to re-enable live trading."
+            )
+
+    def check_data_freshness(
+        self,
+        prices: pd.DataFrame,
+        today: Optional[pd.Timestamp] = None,
+    ) -> None:
+        if prices.empty:
+            self._fail("historical price data is empty")
+        if len(prices.index) == 0:
+            self._fail("historical price data has no dates")
+
+        today_ts = pd.Timestamp.today().normalize() if today is None else pd.Timestamp(today)
+        last_bar = pd.Timestamp(prices.index[-1])
+        stale_days = _business_days_since(last_bar, today_ts)
+        if stale_days > int(self.config.max_stale_business_days):
+            self._fail(
+                "last price bar is stale: "
+                f"{last_bar.date()} is {stale_days} business days behind "
+                f"{pd.Timestamp(today_ts).date()} "
+                f"(max {self.config.max_stale_business_days})"
+            )
+
+    def check_data_audit(self, prices: pd.DataFrame, strat_cfg: MatvmConfig) -> DataAuditResult:
+        audit = audit_price_data(prices, strat_cfg)
+        for warning in audit.warnings:
+            print(f"SAFETY WARNING: data audit warning: {warning}", file=sys.stderr)
+        if audit.errors:
+            self._fail("data audit errors: " + "; ".join(audit.errors))
+        if audit.warnings and not self.config.allow_data_warnings:
+            self._fail("data audit warnings are not allowed: " + "; ".join(audit.warnings))
+        return audit
+
+    def check_position_reconciliation(
+        self,
+        actual_positions: Dict[str, float],
+        expected_positions: Dict[str, float],
+        baseline_accepted: bool,
+    ) -> Optional[Dict[str, float]]:
+        actual = _normalize_position_map(actual_positions)
+        expected = _normalize_position_map(expected_positions)
+
+        if not baseline_accepted:
+            if not self.config.accept_positions:
+                self._fail(
+                    "no persisted broker-position baseline; rerun with --accept-positions "
+                    "after verifying the broker account holdings"
+                )
+            print(
+                "SAFETY NOTICE: accepting current broker positions as the live baseline.",
+                file=sys.stderr,
+            )
+            return actual
+
+        tolerance = float(self.config.position_tolerance_shares)
+        diffs: List[str] = []
+        for symbol in sorted(set(actual) | set(expected)):
+            actual_qty = float(actual.get(symbol, 0.0))
+            expected_qty = float(expected.get(symbol, 0.0))
+            delta = actual_qty - expected_qty
+            if abs(delta) > tolerance:
+                diffs.append(
+                    f"{symbol}: actual={actual_qty:g}, expected={expected_qty:g}, diff={delta:g}"
+                )
+
+        if diffs:
+            self._fail("broker positions differ from persisted baseline: " + "; ".join(diffs))
+        return None
+
+    def check_rebalance_lock(self, current_period: str, last_rebalance_period: Optional[str]) -> None:
+        if (
+            last_rebalance_period
+            and str(last_rebalance_period) == str(current_period)
+            and not self.config.force_rebalance
+        ):
+            self._fail(
+                f"rebalance period {current_period} already traded; rerun with --force to override"
+            )
+
+    def check_order_caps_and_limit_prices(
+        self,
+        current_positions: Dict[str, float],
+        target_shares: Dict[str, int],
+        last_prices: Dict[str, float],
+        equity: float,
+        ibkr_cfg: IbkrConfig,
+    ) -> None:
+        if not np.isfinite(float(equity)) or float(equity) <= 0:
+            self._fail(f"invalid account equity for order-cap checks: {equity}")
+
+        total_turnover = 0.0
+        max_order_notional = float(equity) * float(self.config.max_order_notional_frac)
+        max_total_turnover = float(equity) * float(self.config.max_turnover_frac)
+        current = _normalize_position_map(current_positions)
+
+        for symbol, target in target_shares.items():
+            px = float(last_prices.get(symbol, np.nan))
+            if not np.isfinite(px) or px <= 0:
+                self._fail(f"{symbol}: invalid last price for order safety check: {px}")
+
+            current_qty = float(current.get(symbol, 0.0))
+            delta = int(target) - int(round(current_qty))
+            if delta == 0:
+                continue
+
+            notional = abs(float(delta)) * px
+            total_turnover += notional
+            if notional > max_order_notional:
+                self._fail(
+                    f"{symbol}: order notional {notional:,.2f} exceeds cap "
+                    f"{max_order_notional:,.2f} "
+                    f"({self.config.max_order_notional_frac:.2%} of equity)"
+                )
+
+            if ibkr_cfg.use_limit_orders:
+                buffer = float(ibkr_cfg.limit_buffer_bps) / 10_000.0
+                limit_price = px * (1.0 + buffer) if delta > 0 else px * (1.0 - buffer)
+                deviation = abs(limit_price - px) / px
+                if deviation > float(self.config.limit_price_max_deviation):
+                    self._fail(
+                        f"{symbol}: computed limit price {limit_price:.2f} is "
+                        f"{deviation:.2%} away from last close {px:.2f} "
+                        f"(max {self.config.limit_price_max_deviation:.2%})"
+                    )
+
+        if total_turnover > max_total_turnover:
+            self._fail(
+                f"total turnover {total_turnover:,.2f} exceeds cap "
+                f"{max_total_turnover:,.2f} "
+                f"({self.config.max_turnover_frac:.2%} of equity)"
+            )
+
+
+def _expected_positions_after_rebalance(
+    current_positions: Dict[str, float],
+    target_shares: Dict[str, int],
+) -> Dict[str, float]:
+    expected = _normalize_position_map(current_positions)
+    for symbol, shares in target_shares.items():
+        qty = float(shares)
+        key = str(symbol).upper()
+        if abs(qty) <= 1e-9:
+            expected.pop(key, None)
+        else:
+            expected[key] = qty
+    return expected
+
+
 class IbkrClient:
-    """Thin wrapper around ib_insync that keeps imports optional."""
+    """Thin wrapper around ib_async that keeps imports optional."""
 
     def __init__(self, cfg: IbkrConfig):
         self.cfg = cfg
@@ -5389,22 +5621,16 @@ class IbkrClient:
     def _ensure_asyncio_event_loop() -> None:
         try:
             asyncio.get_running_loop()
-            return
-        except RuntimeError:
-            pass
-
-        try:
-            asyncio.get_event_loop()
         except RuntimeError:
             asyncio.set_event_loop(asyncio.new_event_loop())
 
     def connect(self):
         self._ensure_asyncio_event_loop()
         try:
-            from ib_insync import IB  # type: ignore
+            from ib_async import IB  # type: ignore
         except Exception as e:
             raise RuntimeError(
-                "ib_insync not installed. Run: pip install ib_insync"
+                "ib_async not installed. Run: pip install ib_async"
             ) from e
 
         self.ib = IB()
@@ -5446,7 +5672,7 @@ class IbkrClient:
 
     def _contract_for_symbol(self, symbol: str):
         self._ensure_asyncio_event_loop()
-        from ib_insync import Stock  # type: ignore
+        from ib_async import Stock  # type: ignore
 
         return Stock(symbol, self.cfg.exchange, self.cfg.currency)
 
@@ -5467,7 +5693,7 @@ class IbkrClient:
         assert self.ib is not None
 
         self._ensure_asyncio_event_loop()
-        from ib_insync import util  # type: ignore
+        from ib_async import util  # type: ignore
 
         contracts = self.qualify_contracts(symbols)
         series = []
@@ -5558,6 +5784,8 @@ class IbkrClient:
         account: str,
         target_shares: Dict[str, int],
         dry_run: bool = True,
+        current_positions: Optional[Dict[str, float]] = None,
+        last_prices: Optional[Dict[str, float]] = None,
     ) -> List[Dict[str, object]]:
         """Place orders to move current positions to target_shares.
 
@@ -5568,13 +5796,13 @@ class IbkrClient:
 
         try:
             self._ensure_asyncio_event_loop()
-            from ib_insync import LimitOrder, MarketOrder  # type: ignore
+            from ib_async import LimitOrder, MarketOrder  # type: ignore
         except Exception as e:
-            raise RuntimeError("ib_insync not installed") from e
+            raise RuntimeError("ib_async not installed. Run: pip install ib_async") from e
 
-        current = self.current_positions(account=account)
+        current = current_positions if current_positions is not None else self.current_positions(account=account)
         symbols = list(target_shares.keys())
-        prices = self.last_prices(symbols)
+        prices = last_prices if last_prices is not None else self.last_prices(symbols)
         contracts = {c.symbol: c for c in self.qualify_contracts(symbols)}
 
         deltas: List[Tuple[str, int]] = []
@@ -5663,6 +5891,7 @@ def run_live_ibkr(
     dry_run: bool = True,
     duration: str = "3 Y",
     log_path: Optional[Path] = None,
+    safety_cfg: Optional[SafetyGateConfig] = None,
 ) -> None:
     """Run the strategy once against an IBKR account.
 
@@ -5675,12 +5904,23 @@ def run_live_ibkr(
     """
 
     state = load_state(state_path)
+    safety = SafetyGate(
+        config=safety_cfg or SafetyGateConfig(),
+        state_dir=state_path.parent,
+    )
+    safety.check_halt_file()
     strategy = MatvmStrategy(config=strat_cfg, state=state)
 
     client = IbkrClient(cfg=ibkr_cfg).connect()
     try:
         account = client.managed_account()
         equity = client.net_liquidation(account=account)
+        current_positions = client.current_positions(account=account)
+        accepted_baseline = safety.check_position_reconciliation(
+            actual_positions=current_positions,
+            expected_positions=strategy.state.expected_positions,
+            baseline_accepted=strategy.state.positions_baseline_accepted,
+        )
 
         today = pd.Timestamp.utcnow().tz_localize(None).normalize()
         equity_hist = update_equity_history(equity_history_path, today, equity)
@@ -5688,7 +5928,14 @@ def run_live_ibkr(
 
         symbols = strat_cfg.all_tickers()
         prices = client.historical_daily_prices(symbols, duration=duration)
+        safety.check_data_freshness(prices)
+        audit = safety.check_data_audit(prices, strat_cfg)
         asof = prices.index[-1]
+        current_rebalance_period = rebalance_period_id(asof, strat_cfg.rebalance_freq)
+        safety.check_rebalance_lock(
+            current_period=current_rebalance_period,
+            last_rebalance_period=strategy.state.last_rebalance_period,
+        )
 
         weights = strategy.generate_target_weights(
             prices=prices,
@@ -5702,11 +5949,34 @@ def run_live_ibkr(
 
         # Compute target shares (whole shares)
         target_shares = compute_target_shares_from_weights(weights, equity=equity, last_prices=last_px)
+        safety.check_order_caps_and_limit_prices(
+            current_positions=current_positions,
+            target_shares=target_shares,
+            last_prices=last_px,
+            equity=equity,
+            ibkr_cfg=ibkr_cfg,
+        )
 
         # Place orders to reach target
-        orders = client.place_rebalance_orders(account=account, target_shares=target_shares, dry_run=dry_run)
+        orders = client.place_rebalance_orders(
+            account=account,
+            target_shares=target_shares,
+            dry_run=dry_run,
+            current_positions=current_positions,
+            last_prices=last_px,
+        )
 
         # Persist state
+        if accepted_baseline is not None:
+            strategy.state.expected_positions = accepted_baseline
+            strategy.state.positions_baseline_accepted = True
+        if not dry_run:
+            strategy.state.expected_positions = _expected_positions_after_rebalance(
+                current_positions=current_positions,
+                target_shares=target_shares,
+            )
+            strategy.state.positions_baseline_accepted = True
+            strategy.state.last_rebalance_period = current_rebalance_period
         save_state(state_path, strategy.state)
 
         # Log
@@ -5715,6 +5985,9 @@ def run_live_ibkr(
             "account": account,
             "net_liquidation": float(equity),
             "asof_price_date": str(asof.date()),
+            "rebalance_period": current_rebalance_period,
+            "data_audit_errors": list(audit.errors),
+            "data_audit_warnings": list(audit.warnings),
             "weights": {k: float(v) for k, v in weights.items()},
             "target_shares": target_shares,
             "orders": orders,
@@ -5732,6 +6005,7 @@ def run_live_ibkr(
         print(f"Account:           {account}")
         print(f"Net liquidation:   {equity:,.2f} {ibkr_cfg.currency}")
         print(f"Signal as-of date: {asof.date()}")
+        print(f"Rebalance period:  {current_rebalance_period}")
         print(f"Mode:             {'DRY RUN' if dry_run else 'PLACE ORDERS'}")
 
         print("\nTarget weights:")
@@ -6099,16 +6373,30 @@ def cli_live_ibkr(args: argparse.Namespace) -> None:
     state_path = Path(args.state_file)
     eq_path = Path(args.equity_file)
     log_path = Path(args.log_file) if args.log_file else None
-
-    run_live_ibkr(
-        strat_cfg=strat_cfg,
-        ibkr_cfg=ibcfg,
-        state_path=state_path,
-        equity_history_path=eq_path,
-        dry_run=not args.place_orders,
-        duration=args.duration,
-        log_path=log_path,
+    safety_cfg = SafetyGateConfig(
+        max_stale_business_days=int(args.max_stale_business_days),
+        allow_data_warnings=not bool(args.fail_on_data_warnings),
+        position_tolerance_shares=float(args.position_tolerance_shares),
+        accept_positions=bool(args.accept_positions),
+        force_rebalance=bool(args.force),
+        max_order_notional_frac=float(args.max_order_notional_frac),
+        max_turnover_frac=float(args.max_turnover_frac),
+        limit_price_max_deviation=float(args.limit_price_max_deviation),
     )
+
+    try:
+        run_live_ibkr(
+            strat_cfg=strat_cfg,
+            ibkr_cfg=ibcfg,
+            state_path=state_path,
+            equity_history_path=eq_path,
+            dry_run=not args.place_orders,
+            duration=args.duration,
+            log_path=log_path,
+            safety_cfg=safety_cfg,
+        )
+    except SafetyGateFailure as exc:
+        raise SystemExit(2) from exc
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -6285,6 +6573,51 @@ def build_parser() -> argparse.ArgumentParser:
         "--log-file",
         default="./matvm_state/runs.jsonl",
         help="Append-only JSONL log of each run",
+    )
+    l.add_argument(
+        "--max-stale-business-days",
+        type=int,
+        default=3,
+        help="Abort if the latest historical price bar is older than this many business days",
+    )
+    l.add_argument(
+        "--fail-on-data-warnings",
+        action="store_true",
+        help="Abort on data-audit warnings as well as errors",
+    )
+    l.add_argument(
+        "--position-tolerance-shares",
+        type=float,
+        default=0.0,
+        help="Allowed per-ticker broker-position drift versus persisted state",
+    )
+    l.add_argument(
+        "--accept-positions",
+        action="store_true",
+        help="Accept current broker positions as the first live baseline",
+    )
+    l.add_argument(
+        "--force",
+        action="store_true",
+        help="Allow a second real rebalance in the same rebalance period",
+    )
+    l.add_argument(
+        "--max-order-notional-frac",
+        type=float,
+        default=0.25,
+        help="Abort if any single order exceeds this fraction of account equity",
+    )
+    l.add_argument(
+        "--max-turnover-frac",
+        type=float,
+        default=0.50,
+        help="Abort if total order turnover exceeds this fraction of account equity",
+    )
+    l.add_argument(
+        "--limit-price-max-deviation",
+        type=float,
+        default=0.05,
+        help="Abort if a computed limit price is farther than this fraction from last close",
     )
 
     l.set_defaults(func=cli_live_ibkr)

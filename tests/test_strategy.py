@@ -108,6 +108,9 @@ def test_state_round_trip_preserves_all_fields(tmp_path) -> None:
         ramp_weeks_remaining=2,
         breadth_good_count=4,
         last_signal_date="2026-06-10",
+        last_rebalance_period="2026-06-06/2026-06-12",
+        expected_positions={"VTI": 12.0, "SGOV": 3.0},
+        positions_baseline_accepted=True,
     )
 
     save_state(path, state)
@@ -116,4 +119,3 @@ def test_state_round_trip_preserves_all_fields(tmp_path) -> None:
     assert loaded == state
     data = json.loads(path.read_text(encoding="utf-8"))
     assert "saved_at_utc" in data
-
